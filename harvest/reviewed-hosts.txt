@@ -1,0 +1,10 @@
+# Hosts reviewed for the public list (Nuvio-Project Spec 60 D12). A row whose URL is on a host listed here is
+# public when it passes the private and NSFW rules (harvest/rules.py). One entry per line: host[:port][/path prefix],
+# no scheme, default ports omitted; "#" starts a comment. A path prefix matches whole segments
+# (raw.githubusercontent.com/iptv-org does not match /iptv-org-mirror). Shared hosts (code hosting, file shares,
+# shorteners, video platforms; harvest/allowlist.py) need a path that names ONE publisher (a channel, an owner),
+# never a section shared by all (youtube.com/watch). Say why each entry was reviewed.
+
+iptv-org.github.io                      # iptv-org's playlists and API: the D1 scope definition
+raw.githubusercontent.com/iptv-org      # iptv-org's repositories
+github.com/iptv-org
