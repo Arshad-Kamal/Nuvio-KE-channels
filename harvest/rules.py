@@ -1,14 +1,18 @@
 """Bucket rules for candidate streams (Nuvio-Project Spec 60 D1, D9, D12).
 
 Every candidate row lands in exactly one bucket; nothing is dropped:
-  public   - releasable: passes every rule below AND the allowlist (allowlist.py); reason = the admitting criterion
+  public   - releasable: passes every rule below AND the allowlist (allowlist.py), and carries no query string
+             unless iptv-org lists that exact URL (D15); reason = the admitting criterion
   private  - kept, never published: subscriber credentials, pay-channel or pirate restreams, DRM, non-HTTP,
-             URLs minted for one requester, and every row the allowlist does not admit (unreviewed-host)
+             URLs minted for one requester, every row the allowlist does not admit (unreviewed-host), and admitted
+             rows with parameters (unreviewed-query)
   nsfw     - kept, never published, in a file of its own
 
 Rules match the row's own URL, name, category and source page. A list's notes often describe rows inside it
 ("contains NSFW, exclude"), so notes only count for DRM and minted URLs on a single stream row. The deny rules below
 stay as a second filter behind the allowlist; url_rejection() also decides which iptv-org URLs vouch for a host.
+TOKEN_URL is no longer the gate for query strings (D15): a deny-list of token keys stayed incomplete over three review
+rounds, so a non-iptv-org URL with a query is private whatever its keys; TOKEN_URL still judges paths and cells.
 
 One URL can be found several times (copies). A verdict about the stream itself (its URL, DRM, minted notes, the
 allowlist, NSFW) holds for every copy; a verdict about one copy only (it came from a listed pirate list or a dynamic
@@ -22,7 +26,7 @@ import json
 import re
 from collections.abc import Iterable, Mapping
 from typing import NamedTuple
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 import egress
 from allowlist import Allowlist, has_suffix, split_url
@@ -34,7 +38,8 @@ from allowlist import Allowlist, has_suffix, split_url
 # start, so an embedded URL counts too.
 CREDENTIAL = re.compile(
     r"(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*://[^/@?#\s]+@|"
-    r"(?<![a-z0-9+.-])https?://[^/?#\s]+/(?:live|movie|series|timeshift)/[^/?#]+/[^/?#]+/\d+(?:\.\w+)?(?:$|[?&#\s])|"
+    # nginx merges slashes, so //live/u/p/1 plays like /live/u/p/1
+    r"(?<![a-z0-9+.-])https?://[^/?#\s]+/+(?:live|movie|series|timeshift)/+[^/?#]+/+[^/?#]+/+\d+(?:\.\w+)?(?:$|[?&#\s])|"
     r":2546[13]\b|/line/|/get\.php|[?&]mac=|play_token|[?&]ticket=|X-Plex-Token=|"
     r"[?&](?:username|password|pass|pwd|passwd|secret)=|"
     # Tvheadend's stream API on any port: a personal TV box or headend re-serving its tuner, not a broadcaster.
@@ -109,9 +114,10 @@ TOKEN_URL = re.compile(
     r"signature|key-pair-id|expires|exp|sig|sign|md5|hash|hmac|acl|validto|nva|nvb|sid|session|[a-z_.]*sessionid|"
     r"_lsu_sa_|x-amz-[a-z-]+|[a-z_.-]*api[-_]?key|__token__|ws(?:secret|time)|tx(?:secret|time)|__gda__|ec_secure|st|secure|"
     r"nonce|[a-z_.]*streaming_?id)=|[?&]e=\d{9,}&h=|[?&]h=[0-9a-f]+&e=\d{9,}|"
-    # a query value that is an IP address, IPv4 (with a port) or IPv6 (ads.ip=<viewer>)
-    r"[?&;][^=&#]*=(?:(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?|\[?(?:(?:[0-9a-f]{1,4}:){4,7}[0-9a-f]{1,4}|[0-9a-f:]*::[0-9a-f:]*)\]?)"
-    r"(?=[&#;]|$)|"
+    # a query value that is an IP address, IPv4 (with a port) or IPv6 (ads.ip=<viewer>), ending where the value does
+    # (also before a quote or a space: cells hold JSON and free text); bounded groups, so no backtracking blow-up
+    r"[?&;][^=&#;]*=(?:(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?|\[?(?:(?:[0-9a-f]{1,4}:){4,7}[0-9a-f]{1,4}|"
+    r"(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,6})?::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,6})?)\]?)(?![\w.:-])|"
     r"/(?:token|tkn|session|signature)/|/expires?/\d|/stream/[0-9a-f]{8}-[0-9a-f-]{27}|"
     r"/v1/manifest/[^/]+/[^/]+/[0-9a-f]{8}-[0-9a-f-]{27}/|/sec\d?\(|chunklist_w\d|eyJ[\w-]{8,}\.eyJ",
     re.IGNORECASE,
@@ -148,13 +154,19 @@ class Verdict(NamedTuple):
     copy_only: bool = False  # private only because of this copy's source or cells (module docstring)
 
 
+# The two orders of the four verdict classes; they differ only in where public stands. Across copies (merge) a clean
+# public copy beats a fault of one other copy only; within one copy (stricter) any fault beats public.
+MERGE_ORDER = ("private-copy", "public", "private", "nsfw")
+FAULT_ORDER = ("public", "private-copy", "private", "nsfw")
+
+
+def _class(verdict: Verdict) -> str:
+    return "private-copy" if verdict.bucket == "private" and verdict.copy_only else verdict.bucket
+
+
 def rank(verdict: Verdict) -> int:
     """Merge rank, highest wins: nsfw > private for the stream itself > public > private for one copy only."""
-    if verdict.bucket == "nsfw":
-        return 3
-    if verdict.bucket == "public":
-        return 1
-    return 0 if verdict.copy_only else 2
+    return MERGE_ORDER.index(_class(verdict))
 
 
 def _names_a_person(claims: object) -> bool:
@@ -251,6 +263,16 @@ def _static_source(row: Mapping[str, str]) -> bool:
     return has_suffix(host, STATIC_SOURCES) and not REDIRECT_PATH.match(path)
 
 
+def has_parameters(url: str) -> bool:
+    """Whether the URL carries parameters (D15): a non-empty query, or ";" or "?" in its path or a percent-decoded
+    layer of it. A fragment is never sent to the server and stays (TOKEN_URL still reads it)."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return True
+    return bool(parts.query) or any(mark in layer for layer in egress.layers(parts.path) for mark in (b";", b"?"))
+
+
 def _listed_source(source: str) -> str | None:
     """The PRIVATE_HOSTS entry a row's source page matches: rows copied from a listed pirate list stay private."""
     lowered = source.lower()
@@ -259,7 +281,9 @@ def _listed_source(source: str) -> str | None:
 
 def verdict(row: Mapping[str, str], allow: Allowlist) -> Verdict:
     """The verdict for one copy (extract_research.COLUMNS). NSFW is checked first so it never mixes into private;
-    checks about the stream itself run before checks about this copy, so a copy failing both reports the former."""
+    checks about the stream itself run before checks about this copy, so a copy failing both reports the former. The
+    allowlist and the query check (D15) come last: they read only the URL, so every copy of it fails them alike and
+    the merged row stays private whichever reason it reports."""
     if NSFW_NAME.search(row["name"]) or nsfw_category(row["category"]) or NSFW_URL.search(row["source_page"]):
         return Verdict("nsfw", "nsfw")
     url = row["url"]
@@ -281,7 +305,7 @@ def verdict(row: Mapping[str, str], allow: Allowlist) -> Verdict:
     # Every other published cell: a credential or token written into any of them is published too. A list's notes
     # describe its contents ("contains :25461 entries"), and a directly recorded row's source is its URL, judged above
     # and by the exact-iptv-org exemption.
-    columns = ("name", "country", "language", "category", "format", "headers", "geo_hint") + (
+    columns = ("name", "country", "language", "category", "kind", "format", "headers", "geo_hint") + (
         ("notes",) if stream else ()) + (("source_page",) if row["source_page"] != url else ())
     for column in columns:
         if _hidden_credential(row.get(column, "-")):
@@ -291,7 +315,11 @@ def verdict(row: Mapping[str, str], allow: Allowlist) -> Verdict:
     if stream and not listed_by_iptv_org and not _static_source(row):
         return Verdict("private", "minted", copy_only=True)
     criterion = allow.admit(url)
-    return Verdict("public", criterion) if criterion else Verdict("private", "unreviewed-host")
+    if criterion is None:
+        return Verdict("private", "unreviewed-host")
+    if not listed_by_iptv_org and has_parameters(url):
+        return Verdict("private", "unreviewed-query")
+    return Verdict("public", criterion)
 
 
 def bucket(row: Mapping[str, str], allow: Allowlist) -> tuple[str, str]:
@@ -300,7 +328,7 @@ def bucket(row: Mapping[str, str], allow: Allowlist) -> tuple[str, str]:
 
 
 def _severity(verdict: Verdict) -> int:
-    return {"nsfw": 3, "public": 0}.get(verdict.bucket, 1 if verdict.copy_only else 2)
+    return FAULT_ORDER.index(_class(verdict))
 
 
 def stricter(first: Verdict | None, second: Verdict | None) -> Verdict | None:

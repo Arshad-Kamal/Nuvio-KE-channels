@@ -16,12 +16,12 @@ import socket
 import time
 import urllib.request
 import zlib
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from allowlist import IPTV_ORG_API, IPTV_ORG_STREAMS, MAX_DOWNLOAD, has_suffix
-from rules import DRM, STATIC_SOURCES, url_rejection
+from rules import DRM, M3U_FILE, STATIC_SOURCES, Verdict, stricter, url_rejection
 
 MAX_GUNZIPPED = MAX_DOWNLOAD  # real lists are far smaller; 8 parallel fetches stay within a few hundred MB
 FETCH_TIMEOUT = 30  # per socket operation
@@ -50,6 +50,7 @@ JSON_URL_KEY = re.compile(r"url|link|stream|src|file|source|m3u|hls|play", re.IG
 JSON_NOT_STREAM_KEY = re.compile(r"logo|image|icon|thumb|poster|banner|fanart|^art|epg|guide|site|home|page|license",
                                  re.IGNORECASE)
 JSON_NAME_KEYS = ("name", "title", "channel", "channel_name", "nombre", "nome")
+JSON_CATEGORY_KEYS = ("category", "categories", "group", "group_title", "group-title", "genre", "genres")
 # The request headers kept, by the names lists use (EXTVLCOPT http-* options, Kodi "|Name=value" suffixes). Others
 # (Cookie, Authorization...) are dropped: they would publish a session.
 HEADER_NAMES = {"http-referrer": "Referer", "http-user-agent": "User-Agent", "http-origin": "Origin",
@@ -67,7 +68,6 @@ IPTV_ORG_OWN = re.compile(r"https?://(?:iptv-org\.github\.io/|(?:raw\.githubuser
 EPG_PATH = re.compile(r"epg|guide|\.xml(?:\.gz)?$", re.IGNORECASE)  # not on an M3U path (OpenIPTVItaly_No_EPG.m3u)
 PAGE_HOSTS = ("github.com", "api.github.com", "gist.github.com")
 REDIRECTORS = ("jmp2.uk", "c.mjh.nz")  # and i.mjh.nz/.r/: one stream each, answered per requester
-M3U_PATH = re.compile(r"\.m3u8?$", re.IGNORECASE)
 
 
 class FetchError(Exception):
@@ -128,9 +128,40 @@ def row(name: str, url: str, source: str, **cells: str) -> dict[str, str]:
     return values
 
 
+def list_url(url: str) -> str:
+    """One spelling per list file, the one fetched: a GitHub blob/raw page as raw.githubusercontent.com, a gist page
+    as its /raw, refs/heads/<ref> as <ref> (raw.githubusercontent.com serves both alike)."""
+    url = url.strip()
+    if file := GITHUB_FILE.match(url):
+        url = "https://raw.githubusercontent.com/{}/{}/{}".format(*file.groups())
+    elif gist := GIST_PAGE.match(url):
+        url = "https://gist.github.com/{}/{}/raw".format(*gist.groups())
+    return re.sub(r"^(https://raw\.githubusercontent\.com/[^/]+/[^/]+/)refs/heads/", r"\1", url, flags=re.IGNORECASE)
+
+
+def list_taint(research: Mapping[str, str]) -> Verdict | None:
+    """The verdict every row of a research list carries (its merged "_bucket" and "reason"): nsfw for a list the
+    research put in nsfw, private (this copy only) for a listed pirate list; None otherwise."""
+    if research["_bucket"] == "nsfw":
+        return Verdict("nsfw", "nsfw")
+    if research["reason"].startswith("listed:"):
+        return Verdict("private", research["reason"], copy_only=True)
+    return None
+
+
+def list_taints(research_lists: Iterable[Mapping[str, str]]) -> dict[str, Verdict | None]:
+    """list_url -> the strictest list_taint of every research list row naming that file. Rows pulled from the file
+    and research stream rows citing it (source_page, looked up through list_url) carry it."""
+    taints: dict[str, Verdict | None] = {}
+    for research in research_lists:
+        key = list_url(research["url"])
+        taints[key] = stricter(taints.get(key), list_taint(research))
+    return taints
+
+
 def list_target(row: Mapping[str, str]) -> tuple[str | None, str]:
-    """(URL to fetch, class) for one research list-endpoint/api row; the URL is None when it is not pulled and the
-    class says why."""
+    """(URL to fetch, class) for one research list-endpoint/api row; the URL (list_url's spelling) is None when it is
+    not pulled and the class says why."""
     url = row["url"].strip()
     if not re.match(r"https?://", url, re.IGNORECASE):
         return None, "skip:not-http"
@@ -138,18 +169,13 @@ def list_target(row: Mapping[str, str]) -> tuple[str | None, str]:
         return None, "skip:template"
     if IPTV_ORG_OWN.match(url):
         return None, "skip:iptv-org"
-    if file := GITHUB_FILE.match(url):
-        url = "https://raw.githubusercontent.com/{}/{}/{}".format(*file.groups())
-    elif gist := GIST_PAGE.match(url):
-        url = "https://gist.github.com/{}/{}/raw".format(*gist.groups())
-    # One file, one fetch: raw.githubusercontent.com serves <ref> and refs/heads/<ref> alike.
-    url = re.sub(r"^(https://raw\.githubusercontent\.com/[^/]+/[^/]+/)refs/heads/", r"\1", url, flags=re.IGNORECASE)
+    url = list_url(url)
     try:
         parts = urlsplit(url)
         host, path = (parts.hostname or "").lower(), unquote(parts.path)
     except ValueError:
         return None, "skip:not-http"
-    if "xmltv" in row["format"].lower() or (EPG_PATH.search(path) and not M3U_PATH.search(path)):
+    if "xmltv" in row["format"].lower() or (EPG_PATH.search(path) and not M3U_FILE.search(path)):
         return None, "skip:epg"
     if host == "i.mjh.nz" and ".channels.json" in path:
         return None, "skip:fast-index"
@@ -163,7 +189,7 @@ def list_target(row: Mapping[str, str]) -> tuple[str | None, str]:
         return None, "skip:credential"
     if has_suffix(host, STATIC_SOURCES):
         return url, "static"
-    if M3U_PATH.search(path) or row["format"].lower().startswith("m3u"):
+    if M3U_FILE.search(path) or row["format"].lower().startswith("m3u"):
         return url, "other-host"
     return None, "skip:api"
 
@@ -241,17 +267,29 @@ def fetch(url: str) -> Fetched:
 
 # --- parsing ----------------------------------------------------------------------------------------------------
 
-EXTINF_ATTRIBUTE = re.compile(r'([\w-]+)\s*=\s*"([^"]*)"')  # some lists write tvg-logo= "..."
+# Quoted attributes (some lists write tvg-logo= "..."). A key starts after a non-key character, so a long run of
+# key characters is tried once, not from each of its positions (linear time on a hostile line).
+EXTINF_ATTRIBUTE = re.compile(r'(?<![\w-])([\w-]+)\s*=\s*"([^"]*)"')
+# Unquoted or half-quoted attributes before the name (tvg-chno=69, tvg-id=Action 24.gr"): split on their keys.
+BARE_KEY = re.compile(r"(?<![\w-])((?:tvg|group)-[\w-]+)\s*=", re.IGNORECASE)
+DURATION = re.compile(r"^\s*-?\d+(?:\.\d+)?")
 
 
 def _extinf(line: str) -> tuple[dict[str, str], str]:
-    """Attributes and name of an #EXTINF line. Attributes are read wherever they stand (some lists write
-    '#EXTINF:-1,tvg-id="X",tvg-logo="...",Name'); the name is what follows the duration once they are removed, its
-    leading commas dropped, so a name holding a comma ("CNN, East") stays whole."""
+    """Attributes and name of an #EXTINF line. Quoted attributes are read wherever they stand (some lists write
+    '#EXTINF:-1,tvg-id="X",tvg-logo="...",Name') and removed; the name follows the first comma left, leading commas
+    dropped, so a name holding a comma ("CNN, East") stays whole. What stands before that comma is the duration and
+    unquoted attributes: each value runs to the next key, stray quotes stripped. A line with no comma left is all
+    name."""
     attributes = {k.lower(): v for k, v in EXTINF_ATTRIBUTE.findall(line)}
-    rest = EXTINF_ATTRIBUTE.sub("", line[len("#EXTINF:"):])
-    rest = re.sub(r"^\s*-?\d+(?:\.\d+)?", "", rest)  # the duration
-    return attributes, rest.lstrip(" \t,").strip()
+    rest = DURATION.sub("", EXTINF_ATTRIBUTE.sub("", line[len("#EXTINF:"):]))
+    head, comma, name = rest.partition(",")
+    if not comma:
+        return attributes, rest.strip()
+    parts = BARE_KEY.split(head)  # [junk, key, value, key, value, ...]
+    for key, value in zip(parts[1::2], parts[2::2]):
+        attributes.setdefault(key.lower(), value.strip().strip('"').strip())
+    return attributes, name.lstrip(" \t,").strip()
 
 
 def _stream_url(token: str) -> tuple[str, list[tuple[str, str]]] | None:
@@ -291,10 +329,22 @@ def parse_m3u(text: str, source: str) -> Iterator[dict[str, str]]:
             attributes, name, headers, drm, group = {}, "", [], False, ""
 
 
+def _json_category(node: dict) -> str | None:
+    """The node's category: the first category/group/genre key holding a string or a list of strings."""
+    for key in JSON_CATEGORY_KEYS:
+        value = node.get(key)
+        if isinstance(value, list):
+            value = ";".join(v for v in value if isinstance(v, str))
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
 def parse_json_list(data: object, source: str) -> Iterator[dict[str, str]]:
-    """Rows of a JSON list of any shape: string URLs under stream-like keys, named by the nearest name key. A node with
-    a license/DRM key marks its URLs DRM; a site root is not a stream."""
-    stack = [(data, "")]
+    """Rows of a JSON list of any shape: string URLs under stream-like keys, named by the nearest name key and
+    categorised by the nearest category key (a group's "XXX" reaches the NSFW rules). A node with a license/DRM key
+    marks its URLs DRM; a site root is not a stream."""
+    stack = [(data, ("", "-"))]
     while stack:
         node, context = stack.pop()
         if isinstance(node, list):
@@ -302,7 +352,8 @@ def parse_json_list(data: object, source: str) -> Iterator[dict[str, str]]:
             continue
         if not isinstance(node, dict):
             continue
-        name = next((node[k] for k in JSON_NAME_KEYS if isinstance(node.get(k), str)), context)
+        name = next((node[k] for k in JSON_NAME_KEYS if isinstance(node.get(k), str)), context[0])
+        category = _json_category(node) or context[1]
         drm = any(DRM.search(str(key)) or "license" in str(key).lower() for key in node)
         children = []
         for key, value in node.items():
@@ -311,20 +362,21 @@ def parse_json_list(data: object, source: str) -> Iterator[dict[str, str]]:
                 # clean_url already proved urlsplit reads the URL
                 if (found and JSON_URL_KEY.search(key) and not JSON_NOT_STREAM_KEY.search(key)
                         and urlsplit(found[0]).path.strip("/")):
-                    yield row(name, found[0], source, headers=headers_cell(found[1]),
+                    yield row(name, found[0], source, category=category, headers=headers_cell(found[1]),
                               notes="license key (DRM)" if drm else "-")
             elif isinstance(value, (dict, list)):
-                children.append((value, name))
+                children.append((value, (name, category)))
         stack.extend(reversed(children))
 
 
-def parse_list(fetched: Fetched) -> tuple[str, list[dict[str, str]]]:
+def parse_list(fetched: Fetched, m3u_only: bool = False) -> tuple[str, list[dict[str, str]]]:
     """(kind, rows) of a fetched body: kind "m3u", "json", or "not-a-list" (HLS playlists, pages, other JSON). An HLS
-    media playlist has #EXTINF per segment, so it is told apart by its media tags."""
+    media playlist has #EXTINF per segment, so it is told apart by its media tags. m3u_only: JSON is not parsed (a
+    non-static host's JSON is an API answer, never a list)."""
     text = fetched.body.decode("utf-8", "replace")
     if "#EXTINF" in text and not HLS_MEDIA_PLAYLIST.search(text):
         return "m3u", list(parse_m3u(text, fetched.final_url))
-    if text.lstrip("\ufeff \t\r\n")[:1] in ("[", "{"):
+    if not m3u_only and text.lstrip("\ufeff \t\r\n")[:1] in ("[", "{"):
         try:
             data = json.loads(text.lstrip("\ufeff"))
         except (ValueError, RecursionError):

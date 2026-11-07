@@ -6,8 +6,9 @@ around the world, checked on a schedule so the app only offers channels that are
 Scope: anything [iptv-org](https://github.com/iptv-org/iptv) would list; streams iptv-org lists are included as it
 lists them. A stream is published only when iptv-org lists it, its host already serves an iptv-org stream or a free
 ad-supported (FAST) service, or its host has been reviewed (`harvest/reviewed-hosts.txt`). Streams that need a
-subscriber login, adult channels, DRM streams, URLs made for one viewer (tokens, session links) unless iptv-org lists
-that exact URL, and hosts the research named as pay-channel restreams or proxies are not published.
+subscriber login, adult channels, DRM streams, URLs made for one viewer (tokens, session links) and hosts the research
+named as pay-channel restreams or proxies are not published. A URL with a query string (`?...`) or `;` parameters is
+published only when iptv-org lists that exact URL.
 
 ## Files
 

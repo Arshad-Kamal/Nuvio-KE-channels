@@ -6,8 +6,9 @@ Usage: build_pool.py <public-repo> <private-repo>
 Inputs, in merge order: iptv-org's streams.json; the i.mjh.nz FAST indexes (lists.FAST_INDEXES); the research
 seeds' stream rows (<public>/seed/research-streams.tsv, <private>/seed/research-private.tsv and research-nsfw.tsv);
 every research list endpoint that is a list file (lists.list_target), fetched now. Every copy is bucketed by
-rules.verdict (a row of a list the research put in nsfw, or private as a listed pirate list, also carries that list's
-verdict: list_taint), copies are merged by exact URL (rules.merge), then each row gets its channel key and the iptv-org
+rules.verdict (a row of a list the research put in nsfw, or private as a listed pirate list, and a research stream
+row citing such a list, also carries that list's verdict: lists.list_taints), copies are merged by exact URL
+(rules.merge), then each row gets its channel key and the iptv-org
 blocklist/NSFW joins (channels.py). Fetching iptv-org's API (streams, channels, blocklist) or a FAST index failing
 fails the run (exit 1); a research list failing is recorded in pulls.tsv. Before anything is written every public
 row is checked for this machine's egress IP (egress.py); a hit or a failed lookup fails the run and nothing is
@@ -53,16 +54,6 @@ def fetch_required() -> dict[str, bytes]:
         return {url: fetched.body for url, fetched in zip(urls, pool.map(lists.fetch, urls))}
 
 
-def list_taint(research: dict) -> Verdict | None:
-    """The verdict every row of a research list carries: nsfw for a list the research put in nsfw, private (this copy
-    only) for a listed pirate list; None otherwise."""
-    if research["_bucket"] == "nsfw":
-        return Verdict("nsfw", "nsfw")
-    if research["reason"].startswith("listed:"):
-        return Verdict("private", research["reason"], copy_only=True)
-    return None
-
-
 def _pull(target: tuple[dict, str | None, str]) -> tuple[dict, list[dict[str, str]]]:
     """Fetches and parses one research list endpoint: (pulls.tsv row, rows read)."""
     research, url, kind = target
@@ -75,28 +66,27 @@ def _pull(target: tuple[dict, str | None, str]) -> tuple[dict, list[dict[str, st
         record["status"] = lists.cell(f"error: {error}")
         return record, []
     record["fetched"] = fetched.final_url
-    found, rows = lists.parse_list(fetched)
-    if kind == "other-host" and found != "m3u":  # JSON from a non-static host is an API answer
-        found, rows = "not-a-list", []
+    found, rows = lists.parse_list(fetched, m3u_only=kind == "other-host")
     record.update(status=found, rows=str(len(rows)))
     return record, rows
 
 
-def pull_lists(research_lists: list[dict]) -> tuple[list[dict], list[tuple[list[dict[str, str]], Verdict | None]]]:
-    """pulls.tsv rows (one per research row, in research order) and, per fetched list, its rows and taint. Research
-    rows naming the same file are fetched once, with the strictest taint of all of them."""
-    targets, taints = [], {}
+def pull_lists(research_lists: list[dict], taints: dict[str, Verdict | None]) \
+        -> tuple[list[dict], list[tuple[list[dict[str, str]], Verdict | None]]]:
+    """pulls.tsv rows (one per research row, in research order) and, per fetched list, its rows and taint (taints:
+    lists.list_taints of the same rows). Research rows naming the same file are fetched once; the taint is already
+    the strictest of all of them."""
+    targets, fetching = [], set()
     for research in research_lists:
         url, kind = lists.list_target(research)
-        if url is not None:
-            duplicate = url in taints
-            taints[url] = stricter(taints.get(url), list_taint(research))
-            if duplicate:
-                url, kind = None, "skip:duplicate"
+        if url in fetching:
+            url, kind = None, "skip:duplicate"
+        elif url is not None:
+            fetching.add(url)
         targets.append((research, url, kind))
     with concurrent.futures.ThreadPoolExecutor(FETCH_WORKERS) as pool:
         results = list(pool.map(_pull, targets))
-    pulled = [(rows, taints[url]) for (_, url, _), (_, rows) in zip(targets, results) if url is not None]
+    pulled = [(rows, taints.get(url)) for (_, url, _), (_, rows) in zip(targets, results) if url is not None]
     return [record for record, _ in results], pulled
 
 
@@ -134,11 +124,8 @@ def main() -> int:
     allow = Allowlist(iptv_org, parse_reviewed(REVIEWED_HOSTS.read_text(encoding="utf-8")), vouches)
     seeds = research_seeds(args.public, args.private)
     research_lists = [row for row in seeds if row["kind"] in LIST_KINDS]
-    pulls, pulled = pull_lists(research_lists)
-    # A research stream row cites the page it came from: a tainted research list taints it as it taints pulled rows.
-    cited: dict[str, Verdict | None] = {}
-    for research in research_lists:
-        cited[research["url"]] = stricter(cited.get(research["url"]), list_taint(research))
+    taints = lists.list_taints(research_lists)
+    pulls, pulled = pull_lists(research_lists, taints)
 
     def copies():
         def tagged(rows, where, taint=None):
@@ -148,7 +135,8 @@ def main() -> int:
             yield from tagged(rows, f"fast:{service}")
         for row in seeds:
             if row["kind"] not in LIST_KINDS:
-                yield from tagged([{c: row[c] for c in COLUMNS}], "research", cited.get(row["source_page"]))
+                yield from tagged([{c: row[c] for c in COLUMNS}], "research",
+                                  taints.get(lists.list_url(row["source_page"])))
         for number, (rows, taint) in enumerate(pulled):
             yield from tagged(rows, f"list:{number}", taint)
 

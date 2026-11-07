@@ -7,6 +7,7 @@ import json
 import socket
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -369,7 +370,8 @@ class RoundTwoTest(unittest.TestCase):
     def test_more_requester_values_and_token_keys(self):
         for query in ("ads.ip=2a02:1:2:3:4:5:6:7", "ip=2001:db8::1", "ip=203.0.113.9:8080", "token_id=1", "v2token=1"):
             self.assertEqual(verdict(copy(f"https://cdn.example.org/a.m3u8?{query}"), ALLOW).reason, "minted", query)
-        self.assertEqual(verdict(copy("https://cdn.example.org/a.m3u8?start=12:30:45"), ALLOW).bucket, "public")
+        self.assertEqual(verdict(copy("https://cdn.example.org/a.m3u8?start=12:30:45"), ALLOW).reason,
+                         "unreviewed-query")  # not minted: a time, not an address
 
     def test_short_form_variants_and_refs_heads_duplicates(self):
         allow = Allowlist(["http://198.51.100.7:826/a/b/1"], parse_reviewed(""), vouches)
@@ -377,6 +379,91 @@ class RoundTwoTest(unittest.TestCase):
             self.assertIsNone(allow.admit(f"http://198.51.100.7:826{path}"), path)
         self.assertEqual(lists.list_target(research("https://raw.githubusercontent.com/o/r/refs/heads/main/a.m3u")),
                          ("https://raw.githubusercontent.com/o/r/main/a.m3u", "static"))
+
+
+class QueryAllowlistTest(unittest.TestCase):
+    """D15: a public row that is not an exact iptv-org URL carries no query string."""
+
+    def test_parameters_on_admitted_hosts_are_private(self):
+        allow = Allowlist(["https://iptv.example/a.m3u8", "https://cdn.example.org/b.m3u8"],
+                          parse_reviewed("x.example"), vouches)
+        for url in ("https://cdn.example.org/parliament/hls/webtv.m3u8?hsesid=69f6b557c7fd6782cfc365706424e3c9",
+                    "https://jmp2.uk/plu-5ad8d3a31b95267e225e4e09.m3u8?ads=1",  # fast-host
+                    "https://x.example/a.m3u8?id=1",  # reviewed-host
+                    "https://cdn.example.org/a.m3u8;foo=1", "https://cdn.example.org/a.m3u8%3Fid=1",
+                    "https://cdn.example.org/a.m3u8%253Fid=1"):
+            self.assertEqual(verdict(copy(url), allow), rules.Verdict("private", "unreviewed-query"), url)
+        list_row = copy("https://x.example/list.m3u?type=m3u", kind="list-endpoint")
+        self.assertEqual(verdict(list_row, allow).reason, "unreviewed-query")
+
+    def test_exact_iptv_org_urls_fragments_and_bare_question_marks_stay_public(self):
+        allow = Allowlist(["https://iptv.example/a.m3u8?id=1", "https://cdn.example.org/b.m3u8"],
+                          parse_reviewed(""), vouches)
+        for url in ("https://iptv.example/a.m3u8?id=1", "https://cdn.example.org/c.m3u8#skym3u.dev",
+                    "https://cdn.example.org/c.m3u8?"):
+            self.assertEqual(verdict(copy(url), allow).bucket, "public", url)
+
+    def test_a_clean_copy_does_not_promote_a_query_url(self):
+        url = "https://cdn.example.org/live/q.m3u8?id=1"
+        row = merged(copy(url, "https://raw.githubusercontent.com/zokerpunk/x/a.m3u"), copy(url))[url]
+        self.assertEqual((row["_bucket"], row["reason"]), ("private", "unreviewed-query"))
+
+
+class RoundThreeTest(unittest.TestCase):
+    """Fixes from H1b red-team review round 3 (Spec 60), held until D15."""
+
+    def test_unquoted_and_half_quoted_extinf_attributes_stay_out_of_the_name(self):
+        rows = list(lists.parse_m3u(
+            '#EXTINF:-1 tvg-chno=69 tvg-id="enquetes" group-title="Séries",ENQUÊTES DE CHOC\nhttps://a.example/a\n'
+            '#EXTINF:-1 tvg-id=Action 24.gr" tvg-logo="https://l.example/a.png?raw=true" group-title="Regional",'
+            'Action 24\nhttps://b.example/b\n'
+            "#EXTINF:-1 tvg-id=SomeAdult.us group-title=Adult,Neutral Name\nhttps://cdn.example.org/c.m3u8\n", SOURCE))
+        self.assertEqual([(r["name"], r["tvg_id"], r["category"]) for r in rows],
+                         [("ENQUÊTES DE CHOC", "enquetes", "Séries"), ("Action 24", "Action 24.gr", "Regional"),
+                          ("Neutral Name", "SomeAdult.us", "Adult")])
+        self.assertEqual(verdict(rows[2], ALLOW).bucket, "nsfw")  # the unquoted group-title reaches the rules
+
+    def test_hostile_lines_and_values_parse_in_linear_time(self):
+        started = time.monotonic()
+        for line in ("#EXTINF:" + "a" * 200_000, "#EXTINF:-1 " + "tvg-a " * 40_000 + ",N",
+                     '#EXTINF:-1 a="' + "x" * 200_000, "#EXTINF:-1 " + "a=" * 100_000 + ",N"):
+            list(lists.parse_m3u(line + "\nhttps://a.example/a\n", SOURCE))
+        self.assertFalse(rules._token_shaped("http://h/?" + ";" * 1300 + "=" + ":" * 2700 + "x"))
+        self.assertFalse(rules._token_shaped("http://h/?" + ";a" * 2000 + "=1"))
+        self.assertLess(time.monotonic() - started, 5)  # quadratic regexes took minutes here
+
+    def test_json_lists_carry_the_nearest_category(self):
+        data = {"groups": [{"group": "XXX Movies", "channels": [{"name": "Neutral", "url": "https://cdn.example.org/n.m3u8"}]},
+                           {"name": "News", "categories": ["news", 5, "world"], "url": "https://cdn.example.org/w.m3u8"}]}
+        rows = list(lists.parse_json_list(data, SOURCE))
+        self.assertEqual([(r["name"], r["category"]) for r in rows], [("Neutral", "XXX Movies"), ("News", "news;world")])
+        self.assertEqual(verdict(rows[0], ALLOW).bucket, "nsfw")
+
+    def test_other_host_json_is_never_parsed(self):
+        body = lists.Fetched(SOURCE, SOURCE, b'[{"name": "A", "url": "https://a.example/a.m3u8"}]')
+        with mock.patch.object(lists.json, "loads", side_effect=AssertionError("parsed")):
+            self.assertEqual(lists.parse_list(body, m3u_only=True), ("not-a-list", []))
+
+    def test_long_form_xtream_with_merged_slashes_is_a_credential(self):
+        for url in ("http://198.51.100.7:8080//live/user/pass/5.ts", "http://198.51.100.7:8080/live//user/pass/5.ts"):
+            self.assertEqual(rules.url_rejection(url), ("private", "credential"), url)
+
+    def test_an_ip_value_inside_a_json_or_text_cell_and_the_kind_cell_are_scanned(self):
+        url = "https://cdn.example.org/live/c.m3u8"
+        for cells in ({"headers": '{"Referer":"https://site.example/player?ads.ip=198.51.100.9"}'},
+                      {"notes": "plays via ?ip=198.51.100.9 only"}, {"kind": "stream ?token=ab12"}):
+            self.assertEqual(verdict(copy(url, **cells), ALLOW), rules.Verdict("private", "minted", True), cells)
+
+    def test_iptv_org_channel_strings_are_cleaned_and_a_later_tvg_id_keys_the_row(self):
+        streams = [{"url": "https://p.example/live/a.m3u8?t=1", "channel": "Tab\t.us"},
+                   {"url": f"https://jmp2.uk/plu-{PLUTO_ID}.m3u8", "channel": "New\nline.us"}]
+        join = Channels(streams, CHANNELS, [])
+        self.assertEqual(join.key(pool_row("https://p.example/live/a.m3u8?t=2"), ""), "Tab .us")
+        self.assertEqual(join.key(pool_row(f"https://stitcher.pluto.tv/v1/stitch/hls/channel/{PLUTO_ID}/m.m3u8"), ""),
+                         "New line.us")
+        row = pool_row("https://other.example/k.m3u8")
+        join.apply(row, ["foo", "cnn.us@East"])
+        self.assertEqual(row["channel"], "CNN.us")
 
 
 STREAMS = [
@@ -536,6 +623,11 @@ class BuildPoolTest(unittest.TestCase):
     def test_a_research_stream_citing_an_nsfw_research_list_is_nsfw(self):
         seeds = self.seeds(research(SOURCE, bucket="nsfw", reason="nsfw"))
         seeds["research-streams.tsv"][0]["source_page"] = SOURCE
+        self.assertEqual(self.buckets(seeds, "")["https://iptv.example/r.m3u8"], "nsfw.tsv")
+
+    def test_a_research_stream_citing_a_tainted_list_in_another_spelling_is_tainted(self):
+        seeds = self.seeds(research(SOURCE, bucket="nsfw", reason="nsfw"))
+        seeds["research-streams.tsv"][0]["source_page"] = "https://github.com/someone/lists/blob/refs/heads/main/all.m3u"
         self.assertEqual(self.buckets(seeds, "")["https://iptv.example/r.m3u8"], "nsfw.tsv")
 
     def test_a_duplicate_target_keeps_the_strictest_taint(self):

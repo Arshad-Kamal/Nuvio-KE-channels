@@ -79,7 +79,8 @@ class BucketTest(unittest.TestCase):
                     "https://www.stvr.sk/json/live5f.json?c=1&b=mozilla&p=win&f=0&d=1",  # p= is not a password
                     "https://rtmp.apa.tv/@pagroup!23.m3u8",  # "@" in the path, not userinfo
                     "https://news.example.org/widget.php?id=4"):  # not get.php
-            self.assertEqual(b(url)[0], "public", url)
+            # A query sends the row private under D15, but past every deny rule.
+            self.assertIn(b(url)[1], ("iptv-org-host", "reviewed-host", "unreviewed-query"), url)
 
     def test_listed_hosts_are_private(self):
         self.assertEqual(b("https://mini.allinonereborn.fun/tata.php?id=1")[0], "private")
@@ -493,6 +494,16 @@ class MainTest(unittest.TestCase):
         code, written = self.run_main(tsv_line("A", "https://a.example/a.m3u8") + "\n",
                                       ["https://a.example/a.m3u8"], ips=None)
         self.assertEqual((code, written), (1, {}))
+
+    def test_a_stream_citing_an_nsfw_research_list_in_another_spelling_is_nsfw(self):
+        listed = "\t".join(["Erotica lists", "https://raw.githubusercontent.com/o/r/main/x.m3u"] + ["-"] * 3
+                           + ["list-endpoint", "m3u"] + ["-"] * 4)
+        cited = "\t".join(["S", "https://a.example/s.m3u8"] + ["-"] * 3 + ["stream", "hls", "-", "-",
+                          "https://github.com/o/r/blob/refs/heads/main/x.m3u", "-"])
+        code, written = self.run_main(listed + "\n" + cited + "\n", ["https://a.example/a.m3u8"])
+        self.assertEqual(code, 0)
+        self.assertIn("https://a.example/s.m3u8\t", written["research-nsfw.tsv"])
+        self.assertNotIn("https://a.example/s.m3u8\t", written["research-streams.tsv"])
 
 
 if __name__ == "__main__":

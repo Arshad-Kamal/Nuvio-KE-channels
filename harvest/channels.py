@@ -72,9 +72,9 @@ class Channels:
     def __init__(self, streams: list, channels: list, blocklist: list):
         """iptv-org's streams.json, channels.json and blocklist.json, parsed."""
         self.info = {c["id"].lower(): c for c in channels if isinstance(c, dict) and isinstance(c.get("id"), str)}
-        listed = [(s["url"], s["channel"], s.get("feed")) for s in streams
+        listed = [(s["url"], cell(s["channel"], 100), s.get("feed")) for s in streams
                   if isinstance(s, dict) and isinstance(s.get("url"), str) and isinstance(s.get("channel"), str)]
-        self.by_url = {url: cell(f"{channel}@{feed}" if feed else channel, 100) for url, channel, feed in listed}
+        self.by_url = {url: cell(f"{channel}@{feed}", 100) if feed else channel for url, channel, feed in listed}
         paths = [(_host_path(url), provider_id(url), channel) for url, channel, _ in listed]
         self.by_path = _unique((path, channel) for path, _, channel in paths if path)
         self.by_provider = _unique((provider, channel) for _, provider, channel in paths if provider)
@@ -112,10 +112,10 @@ class Channels:
             row["_bucket"], row["reason"] = "private", cell(f"blocklist:{blocked}")
 
     def apply(self, row: dict, tvg_ids: list[str]) -> None:
-        """Sets row["channel"] (keyed by the first tvg-id); a blocklisted or NSFW channel, named by the key or by any
-        copy's tvg-id, moves the row out of public (NSFW out of private too); empty country and category cells are
-        filled from channels.json."""
-        row["channel"] = self.key(row, tvg_ids[0] if tvg_ids else "")
+        """Sets row["channel"] (keyed by the first copy's tvg-id that names a channels.json id); a blocklisted or NSFW
+        channel, named by the key or by any copy's tvg-id, moves the row out of public (NSFW out of private too); empty
+        country and category cells are filled from channels.json."""
+        row["channel"] = self.key(row, next((t for t in tvg_ids if self.info.get(t.split("@")[0].lower())), ""))
         named = [self.info.get(k.split("@")[0].lower()) for k in [row["channel"], *tvg_ids]]
         for info in filter(None, named):
             self._flag(row, info)

@@ -3,7 +3,8 @@
   fast-host      its host belongs to a FAST service i.mjh.nz indexes (Pluto, Samsung TV Plus, Roku, Plex),
   iptv-org-host  its host already serves a stream in iptv-org's streams.json, or
   reviewed-host  its host (or host/path prefix) is listed in reviewed-hosts.txt.
-Anything else is private with reason "unreviewed-host"; adding an entry to reviewed-hosts.txt promotes its rows.
+Anything else is private with reason "unreviewed-host"; adding an entry to reviewed-hosts.txt promotes its rows. A row
+admitted by any criterion but iptv-org-url must also carry no query string (D15; rules.has_parameters).
 
 The two host criteria compare a tenant key, not a bare hostname: host[:port] (default ports dropped), plus the owner
 path on a code or path-style storage host (raw.githubusercontent.com/<owner>), so one listed owner does not admit

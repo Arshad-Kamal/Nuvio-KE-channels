@@ -6,9 +6,11 @@ Usage: extract_research.py [--streams streams.json] <public-repo> <private-repo>
 Each researcher report ends in a fenced ```tsv block with 11 columns (name, url, country, language, category,
 kind, format, headers, geo_hint, source_page, notes). Rows with another column count are analysis tables and are
 skipped and counted; a skipped line that holds a URL (any "scheme://") fails the run (exit 1). A block's first
-line is dropped only when it is a header (its first cell is exactly "name"); otherwise it is read as data. Rows are
-deduplicated by exact URL (rules.merge: the highest-ranked copy wins, a copy private only for its own source or cells
-yields to a public copy), and every report that recorded the URL is listed in seen_in. The allowlist
+line is dropped only when it is a header (its first cell is exactly "name"); otherwise it is read as data. A stream
+row whose source page is a research list the research put in nsfw, or private as a listed pirate list, carries that
+list's verdict (lists.list_taints, as in build_pool). Rows are deduplicated by exact URL (rules.merge: the
+highest-ranked copy wins, a copy private only for its own source or cells yields to a public copy), and every report
+that recorded the URL is listed in seen_in. The allowlist
 (allowlist.py) is built from iptv-org's streams.json (downloaded unless --streams names a local copy) and
 reviewed-hosts.txt. Before anything is written, every public row is checked for this machine's egress IP
 (egress.py); a hit or a failed lookup fails the run (exit 1) and no file is written. Outputs (plain TSV, values
@@ -25,8 +27,9 @@ import sys
 from pathlib import Path
 
 import egress
+import lists
 from allowlist import Allowlist
-from rules import LIST_KINDS, merge, verdict, vouches
+from rules import LIST_KINDS, merge, stricter, verdict, vouches
 
 COLUMNS = ["name", "url", "country", "language", "category", "kind", "format", "headers", "geo_hint",
            "source_page", "notes"]
@@ -100,7 +103,11 @@ def main() -> int:
             print(f"  SKIPPED WITH A URL: {line[:200]}", file=sys.stderr)
         return 1
     allow = Allowlist.load(args.streams, vouches)
-    kept = merge((row, where, verdict(row, allow)) for row, where in pairs)
+    judged = [(row, where, verdict(row, allow)) for row, where in pairs]
+    taints = lists.list_taints(merge(c for c in judged if c[0]["kind"] in LIST_KINDS).values())
+    kept = merge((row, where, found if row["kind"] in LIST_KINDS
+                  else stricter(found, taints.get(lists.list_url(row["source_page"]))))
+                 for row, where, found in judged)
 
     def pick(b: str, kinds: tuple[str, ...] | None = None) -> list[dict]:
         return [{k: v for k, v in r.items() if not k.startswith("_")} for r in kept.values()
