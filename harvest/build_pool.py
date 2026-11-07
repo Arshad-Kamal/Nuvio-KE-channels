@@ -8,13 +8,12 @@ seeds' stream rows (<private>/seed/research-{public,private,nsfw}.tsv, extract_r
 endpoint that is a list file (lists.list_target), fetched now. Every copy is bucketed by rules.verdict (a row of a
 list the research put in nsfw, or private as a listed pirate list, and a research stream row citing such a list,
 also carries that list's verdict: lists.list_taints), copies are merged by exact URL (rules.merge), then each row
-gets its channel key and the iptv-org blocklist/NSFW joins, and NSFW spreads to every URL of a FAST channel
-(channels.py). streams.tsv is the only public output
-(D16). Fetching iptv-org's API (streams, channels, blocklist) or a FAST index failing fails the run (exit 1); a
-research list failing is recorded in pulls.tsv. Before anything is written every public row is checked for this
-machine's egress IP (egress.py); a hit or a failed lookup fails the run and nothing is written. A private repo that
-is the public checkout (swapped arguments) is refused (extract_research.private_repo). Outputs (plain TSV, values
-verbatim):
+gets its channel key and the iptv-org blocklist/NSFW joins, and NSFW spreads to every URL holding an nsfw row's FAST
+channel id (channels.py). streams.tsv is the only public output (D16). Fetching iptv-org's API (streams, channels,
+blocklist) or a FAST index failing fails the run (exit 1); a research list failing is recorded in pulls.tsv. Before
+anything is written every public row is checked for this machine's egress IP (egress.py); a hit or a failed lookup
+fails the run and nothing is written. A private repo that is the public checkout (swapped arguments) is refused
+(extract_research.private_repo). Outputs (plain TSV, values verbatim):
   <public>/pool/streams.tsv     public candidate streams (extract_research.OUT_COLUMNS + channel)
   <private>/pool/private.tsv    private rows with their reason
   <private>/pool/nsfw.tsv       NSFW rows

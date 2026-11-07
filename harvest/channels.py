@@ -8,8 +8,8 @@ exactly one channels.json channel; else empty. A row whose channel key or tvg-id
 or marks NSFW (Channels._nsfw) moves bucket; so does a row whose key names no channels.json channel (empty,
 "<service>:<id>") and whose name (any copy's) is an NSFW channel's name or alt name in any country (Spec 60 D19 audit:
 iptv-org lists no stream for Pluto DE's erotic channels, so their provider ids map to nothing). spread_nsfw then moves
-every URL of a FAST channel with an nsfw row. Every value taken from iptv-org's files is cleaned with lists.cell before
-it is published.
+every URL holding the FAST channel id of an nsfw row (Spec 60 D20). Every value taken from iptv-org's files is cleaned
+with lists.cell before it is published.
 """
 import re
 import unicodedata
@@ -17,12 +17,21 @@ from collections import defaultdict
 from collections.abc import Iterable
 from urllib.parse import unquote, urlsplit
 
+import egress
 from lists import cell
 from rules import nsfw_category
 
 JMP2_SLUGS = {"plu": "pluto", "stvp": "samsung", "sam": "samsung", "rok": "roku", "plex": "plex"}
 JMP2_PATH = re.compile(r"/(plu|stvp|sam|rok|plex)-([A-Za-z0-9-]+?)(?:\.m3u8)?")
 PLUTO_PATH = re.compile(r"/channels?/([0-9a-f]{24})(?:/|$)", re.IGNORECASE)
+# The per-service redirector spelling on i.mjh.nz and jmp2.uk (/PlutoTV/<id>-alt.m3u8, /SamsungTVPlus/<id>.m3u8)
+SERVICE_PATH = re.compile(r"/(PlutoTV|SamsungTVPlus|Roku|Plex)/([A-Za-z0-9-]+?)(?:-alt)?\.m3u8", re.IGNORECASE)
+SERVICE_DIRS = {"plutotv": "pluto", "samsungtvplus": "samsung", "roku": "roku", "plex": "plex"}
+# A FAST channel id as the indexes write it, lowercased (a Plex key "<lineup>-<channel>": its channel part). Nothing
+# shorter or looser can reach other rows (spread_nsfw).
+FAST_ID_SHAPES = {"pluto": re.compile(r"[0-9a-f]{24}"), "samsung": re.compile(r"[a-z]{2,4}\d{6,}[a-z0-9]{0,3}"),
+                  "roku": re.compile(r"[0-9a-f]{32}"), "plex": re.compile(r"[0-9a-f]{24}")}
+URL_WORD = re.compile(rb"[0-9a-z]+")
 QUALITY = re.compile(r"\b(?:u?hd|fhd|sd|[48]k|hevc|h\.?26[45]|\d{3,4}[pi]|backup|geo-blocked|not 24/7)\b")
 COUNTRY_CODE = re.compile(r"[A-Za-z]{2}")
 
@@ -38,13 +47,16 @@ def _split(url: str) -> tuple[str, str] | None:
 
 
 def provider_id(url: str) -> str | None:
-    """"<service>:<id>" for a FAST URL (jmp2.uk slugs, Pluto stitcher paths, i.mjh.nz .r slugs), else None."""
+    """"<service>:<id>" for a FAST URL (jmp2.uk slugs, i.mjh.nz/jmp2.uk per-service paths, Pluto stitcher paths,
+    i.mjh.nz .r slugs), else None."""
     split = _split(url)
     if split is None:
         return None
     host, path = split
     if host == "jmp2.uk" and (slug := JMP2_PATH.fullmatch(path)):
         return f"{JMP2_SLUGS[slug[1]]}:{slug[2].lower()}"
+    if host in ("i.mjh.nz", "jmp2.uk") and (named := SERVICE_PATH.fullmatch(path)):
+        return f"{SERVICE_DIRS[named[1].lower()]}:{named[2].lower()}"
     if (host == "pluto.tv" or host.endswith(".pluto.tv")) and (channel := PLUTO_PATH.search(path)):
         return f"pluto:{channel[1].lower()}"
     if host == "i.mjh.nz" and path.startswith("/.r/") and len(path) > 4:
@@ -76,14 +88,29 @@ def _to_nsfw(row: dict) -> None:
         row["_bucket"], row["reason"] = "nsfw", "nsfw"
 
 
+def fast_id(url: str) -> str | None:
+    """The FAST channel id a URL names (provider_id; a Plex key's channel part, its lineup part varies), or None when
+    the URL names none or the id lacks its service's shape (FAST_ID_SHAPES; .r slugs are names, never ids)."""
+    service, _, ident = (provider_id(url) or "").partition(":")
+    if service == "plex":
+        ident = ident.rpartition("-")[2]
+    shape = FAST_ID_SHAPES.get(service)
+    return ident if shape and shape.fullmatch(ident) else None
+
+
+def _url_words(url: str) -> set[str]:
+    """The lowercased letter-digit runs of a URL and its percent-decoded layers."""
+    return {word.decode() for layer in egress.layers(url) for word in URL_WORD.findall(layer.lower())}
+
+
 def spread_nsfw(rows: Iterable[dict]) -> None:
-    """Moves every row of a FAST channel (provider_id) to nsfw when any row of it is nsfw: the verdict belongs to the
-    channel, not one URL spelling (a stitcher URL of a Pluto adult-group channel). Provider ids only, so one mislabelled
-    list row cannot drag a broadcaster's URLs along."""
+    """Moves to nsfw every row whose URL holds, as a whole word, the FAST channel id (fast_id) of an nsfw row, however
+    the URL spells the channel (a stitcher path, a per-service path, a query value): the verdict belongs to the channel
+    (Spec 60 D20). Ids only, never a name or channel key, so a mislabelled list row cannot drag a broadcaster along."""
     rows = list(rows)
-    nsfw = {provider for row in rows if row["_bucket"] == "nsfw" and (provider := provider_id(row["url"]))}
+    ids = {ident for row in rows if row["_bucket"] == "nsfw" and (ident := fast_id(row["url"]))}
     for row in rows:
-        if provider_id(row["url"]) in nsfw:
+        if row["_bucket"] != "nsfw" and not ids.isdisjoint(_url_words(row["url"])):
             _to_nsfw(row)
 
 

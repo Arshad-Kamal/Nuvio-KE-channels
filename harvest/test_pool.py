@@ -19,7 +19,7 @@ import extract_research
 import lists
 import rules
 from allowlist import Allowlist, parse_reviewed
-from channels import Channels, name_key, provider_id, spread_nsfw
+from channels import Channels, fast_id, name_key, provider_id, spread_nsfw
 from extract_research import COLUMNS, OUT_COLUMNS
 from rules import verdict, vouches
 
@@ -88,8 +88,10 @@ class JsonListTest(unittest.TestCase):
     def test_deep_nesting_does_not_recurse(self):
         data = {"url": "https://a.example/a.m3u8"}
         for _ in range(5000):
-            data = {"x": data}
+            data = {"adult": data}
+        started = time.monotonic()
         self.assertEqual(len(list(lists.parse_json_list(data, SOURCE))), 1)
+        self.assertLess(time.monotonic() - started, 5)  # str() of each nested flag value took 19 s here (round 7)
 
     def test_bodies_that_are_not_lists(self):
         for body in (b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhttps://a.example/1.m3u8\n", b"<html></html>",
@@ -411,9 +413,13 @@ class ListsTest(unittest.TestCase):
             {"name": "Ch 2", "description": "Hustler late night", "url": "https://cdn.example.org/2.m3u8"},
             {"name": "Ch 3", "is_adult": True, "url": "https://cdn.example.org/3.m3u8"},
             {"name": "Ch 4", "channel": "CNN.us", "nsfw": False, "logo": "https://i.example/7IxXX6f.png",
-             "youtube": "UCXXxRHhOXI6xFu8kDwV5UnQ", "url": "https://cdn.example.org/4.m3u8"}]}  # run 15 id
+             "youtube": "UCXXxRHhOXI6xFu8kDwV5UnQ", "url": "https://cdn.example.org/4.m3u8"},  # run 15 id
+            {"name": "Ch 5", "title": "HotXXX", "url": "https://cdn.example.org/5.m3u8"},  # a glued xxx in a name key
+            {"name": "Ch 6", "tvg_name": "Late HotXXX", "url": "https://cdn.example.org/6.m3u8"},
+            {"name": "Ch 7", "title": "https://i.example/7IxXX6f.png", "url": "https://cdn.example.org/7.m3u8"}]}
         rows = list(lists.parse_json_list(data, SOURCE))
-        self.assertEqual([verdict(r, ALLOW).bucket for r in rows], ["nsfw", "nsfw", "nsfw", "public"])
+        self.assertEqual([verdict(r, ALLOW).bucket for r in rows],
+                         ["nsfw", "nsfw", "nsfw", "public", "nsfw", "nsfw", "public"])
         self.assertEqual(rows[3]["tvg_id"], "CNN.us")
 
     def test_german_and_french_erotic_names(self):
@@ -428,7 +434,7 @@ class ListsTest(unittest.TestCase):
         listed = copy("https://cdn.example.org/a.m3u8", category="Pluto DE: Sinnliche Fantasien")  # free text
         self.assertEqual(verdict(listed, ALLOW).bucket, "nsfw")
 
-    def test_json_tvg_id_carries_to_children_and_scalar_adult_flags(self):
+    def test_json_tvg_id_carry_scalar_adult_flags_and_text_without_urls(self):
         data = {"channel": "Adult.us", "sources": [{"file": "https://cdn.example.org/1.m3u8"}],
                 "more": [{"name": "A", "adult": "yes", "url": "https://cdn.example.org/2.m3u8"},
                          {"name": "B", "is_nsfw": 1, "url": "https://cdn.example.org/3.m3u8"},
@@ -436,10 +442,16 @@ class ListsTest(unittest.TestCase):
                          {"name": "D", "notes": "https://x.example/p Hustler late night", "url": "https://cdn.example.org/5.m3u8"}]}
         rows = list(lists.parse_json_list(data, SOURCE))
         self.assertEqual([r["tvg_id"] for r in rows], ["Adult.us"] * 5)
-        # C: a dict-valued flag is not read (scalars only); the nested {"adult": "true"} marks only its own children
+        # C: a dict-valued flag is no flag, and its nested {"adult": "true"} marks only its own children (the
+        # scalar-only read is a cost fix, pinned by test_deep_nesting_does_not_recurse)
         self.assertEqual([verdict(r, ALLOW).bucket for r in rows], ["public", "nsfw", "nsfw", "public", "nsfw"])
-        rows = list(lists.parse_m3u('#EXTINF:-1 tvg-name="HotXXX TV",Late\nhttps://cdn.example.org/6.m3u8\n', SOURCE))
-        self.assertEqual(verdict(rows[0], ALLOW).bucket, "nsfw")  # a glued "xxx" in tvg-name
+
+    def test_m3u_tvg_name_meets_the_name_rule_without_its_urls(self):
+        rows = list(lists.parse_m3u(
+            '#EXTINF:-1 tvg-name="HotXXX TV",Late\nhttps://cdn.example.org/1.m3u8\n'  # a glued "xxx"
+            "#EXTINF:-1 tvg-name=Foo logo=http://i.imgur.com/7IxXX6f.png,Foo\nhttps://cdn.example.org/2.m3u8\n",
+            SOURCE))
+        self.assertEqual([verdict(r, ALLOW).bucket for r in rows], ["nsfw", "public"])
 
     def test_a_json_drm_key_marks_its_own_urls_only(self):
         # run 12 shapes: teleonline's root "license" is its content licence; Zappr's clearkey channel has a non-DRM
@@ -495,7 +507,8 @@ class RulesTest(unittest.TestCase):
             self.assertEqual(rules.url_rejection(f"https://iptv.example/a.m3u8?t={token}"), ("private", "credential"))
 
     def test_free_text_adult_categories(self):
-        for category in ("XXX Movies", "Adult Channels", "18+", "news;Porn"):
+        # "xxx", "adult", "erotic" and "nsfw" as whole category tokens (a token set until round 8) included
+        for category in ("XXX Movies", "Adult Channels", "18+", "news;Porn", "xxx", "news; adult", "Erotic", "nsfw"):
             self.assertTrue(rules.nsfw_category(category), category)
         for category in ("Adult Swim", "general", "-"):
             self.assertFalse(rules.nsfw_category(category), category)
@@ -681,12 +694,28 @@ class ChannelsTest(unittest.TestCase):
         join.apply(row, ["Tab.us"])
         self.assertEqual((row["country"], row["category"], row["_bucket"]), ("U S", "news xxx", "nsfw"))
 
-    def test_nsfw_spreads_to_every_url_of_a_fast_channel_only(self):
-        fast = pool_row(f"https://jmp2.uk/plu-{PLUTO_ID}.m3u8", bucket="nsfw")
-        stitcher = pool_row(f"https://service-stitcher.clusters.pluto.tv/stitch/hls/channel/{PLUTO_ID}/master.m3u8")
-        other = pool_row("https://iptv.example/a.m3u8")
-        spread_nsfw([fast, stitcher, other])
-        self.assertEqual([r["_bucket"] for r in (fast, stitcher, other)], ["nsfw", "nsfw", "public"])
+    def test_nsfw_reaches_every_url_holding_the_fast_id_of_an_nsfw_row(self):
+        lineup, channel = "608049aefa2b8ae93c2c3a63", "64695233f73356567a64ce90"
+        other_channel = "6111b06a8f945c002c45dd12"
+        nsfw = [pool_row(f"https://jmp2.uk/plu-{PLUTO_ID}.m3u8", bucket="nsfw"),
+                pool_row(f"https://jmp2.uk/plex-{lineup}-{channel}.m3u8", bucket="nsfw"),
+                pool_row("https://jmp2.uk/stvp-GB1", bucket="nsfw"),  # too short to be an id
+                pool_row("https://adult.example/x.m3u8", bucket="nsfw")]  # no FAST id
+        reached = [
+            pool_row(f"https://service-stitcher.clusters.pluto.tv/stitch/hls/channel/{PLUTO_ID}/master.m3u8"),
+            pool_row(f"https://i.mjh.nz/PlutoTV/{PLUTO_ID}-alt.m3u8"),
+            pool_row(f"https://proxy.example/play?u=pluto%2Fchannel%2F{PLUTO_ID.upper()}%2Fm.m3u8"),  # a query value
+            pool_row(f"https://i.mjh.nz/Plex/0123456789abcdef01234567-{channel}.m3u8", bucket="private")]  # lineup
+        kept = [pool_row(f"https://jmp2.uk/plu-{PLUTO_ID[::-1]}.m3u8"),  # another Pluto channel
+                pool_row(f"https://jmp2.uk/plex-{lineup}-{other_channel}.m3u8"),  # same lineup, another channel
+                pool_row(f"https://cdn.example.org/x{PLUTO_ID}.m3u8"),  # the id inside a longer word
+                pool_row("https://jmp2.uk/stvp-GB1.m3u8"), pool_row("https://cdn.example.org/gb1/x.m3u8"),
+                pool_row("https://adult.example/y.m3u8")]  # the nsfw non-FAST row's host
+        for row in kept:
+            row["channel"] = "Same.us"  # a shared channel key does not spread
+        spread_nsfw(nsfw + reached + kept)
+        self.assertEqual([(r["_bucket"], r["reason"]) for r in reached], [("nsfw", "nsfw")] * len(reached))
+        self.assertEqual([r["_bucket"] for r in kept], ["public"] * len(kept))
 
     def test_any_copy_name_alt_names_blocklist_nsfw_and_an_empty_key(self):
         join = Channels(STREAMS, CHANNELS + [
@@ -711,6 +740,16 @@ class ChannelsTest(unittest.TestCase):
         self.assertEqual(name_key("ＢＢＣ One (720p) [Not 24/7] FHD"), "bbc one")
         self.assertEqual(provider_id("https://i.mjh.nz/%2Er/maori.m3u8"), "mjh:maori")
         self.assertIsNone(provider_id("https://jmp2.uk/other"))
+        self.assertEqual(provider_id(f"https://i.mjh.nz/PlutoTV/{PLUTO_ID}-alt.m3u8"), f"pluto:{PLUTO_ID}")
+        self.assertEqual(provider_id(f"https://jmp2.uk/PlutoTV/{PLUTO_ID}.m3u8"), f"pluto:{PLUTO_ID}")
+        self.assertEqual(provider_id("https://i.mjh.nz/SamsungTVPlus/USBC4400020H7.m3u8"), "samsung:usbc4400020h7")
+        self.assertEqual(provider_id("https://i.mjh.nz/Plex/aa-bb.m3u8"), "plex:aa-bb")
+        self.assertIsNone(provider_id("https://i.mjh.nz/PlutoTV/.channels.json"))
+        self.assertEqual(fast_id("https://i.mjh.nz/SamsungTVPlus/USBC4400020H7.m3u8"), "usbc4400020h7")
+        self.assertEqual(fast_id(f"https://jmp2.uk/plex-{PLUTO_ID[::-1]}-{PLUTO_ID}.m3u8"), PLUTO_ID)  # channel part
+        for url in ("https://i.mjh.nz/.r/maori.m3u8", "https://jmp2.uk/stvp-GB1", "https://jmp2.uk/rok-abc.m3u8",
+                    "https://iptv.example/a.m3u8"):
+            self.assertIsNone(fast_id(url), url)
 
     def test_iptv_org_channel_strings_are_cleaned_and_a_later_tvg_id_keys_the_row(self):
         streams = [{"url": "https://p.example/live/a.m3u8?t=1", "channel": "Tab\t.us"},

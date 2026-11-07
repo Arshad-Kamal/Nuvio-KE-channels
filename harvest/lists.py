@@ -53,6 +53,7 @@ JSON_URL_KEY = re.compile(r"url|link|stream|src|file|source|m3u|hls|play", re.IG
 JSON_NOT_STREAM_KEY = re.compile(r"logo|image|icon|thumb|poster|banner|fanart|^art|epg|guide|site|home|page|license",
                                  re.IGNORECASE)
 JSON_NAME_KEYS = ("name", "title", "channel", "channel_name", "nombre", "nome")
+JSON_NSFW_NAME_KEYS = JSON_NAME_KEYS + ("tvg-name", "tvg_name")  # judged by the name rule (NSFW_NAME), as in M3U
 JSON_CATEGORY_KEYS = ("category", "categories", "group", "group_title", "group-title", "genre", "genres")
 JSON_TVG_ID_KEYS = ("tvg_id", "tvg-id", "channel")  # iptv-org API mirrors carry the channel id as "channel"
 JSON_ADULT_FLAG = re.compile(r"(?:is_?)?(?:nsfw|adult)", re.IGNORECASE)  # fullmatched against a key
@@ -343,8 +344,9 @@ def parse_m3u(text: str, source: str) -> Iterator[dict[str, str]]:
     """Rows of an extended M3U playlist (#EXTINF + URL line). Directives may come before or after #EXTINF (Kodi lists
     put #KODIPROP first), so an entry's state is cleared only after its URL line. The category is group-title and
     #EXTGRP. NSFW signals beyond the name and category cells: the name terms (NSFW_TEXT) anywhere in the #EXTINF line
-    but its URLs (tvg-name, a name an unquoted attribute swallowed; a logo URL's random "7IxXX6f" is not a name), and
-    the category rules on the leftover (_extinf). A URL line with no #EXTINF of its own (another URL of the entry
+    but its URLs (tvg-name, a name an unquoted attribute swallowed; a logo URL's random "7IxXX6f" is not a name),
+    tvg-name without its URLs also by the name rule (NSFW_NAME: a glued "HotXXX" counts, as in the name cell), and the
+    category rules on the leftover (_extinf). A URL line with no #EXTINF of its own (another URL of the entry
     before) keeps that entry's NSFW signal but not its name or tvg-id (run 15: lists put unrelated backups there)."""
     extinf, headers, drm, group, nsfw = "", [], False, "", False
     for raw in text.splitlines():
@@ -362,7 +364,8 @@ def parse_m3u(text: str, source: str) -> Iterator[dict[str, str]]:
             attributes, name, leftover = _extinf(extinf) if extinf else ({}, "", "")
             categories = (attributes.get("group-title"), group)
             own = (bool(NSFW_TEXT.search(URL_IN_TEXT.sub(" ", extinf)))
-                   or bool(NSFW_NAME.search(attributes.get("tvg-name", ""))) or nsfw_category(leftover)
+                   or bool(NSFW_NAME.search(URL_IN_TEXT.sub(" ", attributes.get("tvg-name", ""))))
+                   or nsfw_category(leftover)
                    or nsfw_category("; ".join(filter(None, categories))))
             carried = nsfw and not extinf  # another URL of the entry before (its #EXTGRP is not repeated)
             nsfw = own or carried
@@ -394,10 +397,11 @@ def parse_json_list(data: object, source: str) -> Iterator[dict[str, str]]:
     """Rows of a JSON list of any shape: string URLs under stream-like keys, named by the nearest name key; the category
     is the node's own, then its ancestors' (a group's "XXX" survives a child's "Movies" and reaches the NSFW rules),
     capped (_category). As in M3U, the name terms (NSFW_TEXT) in any other text of the node (not a URL: a description,
-    an ancestor's name) and a true nsfw/adult flag are NSFW signals; they mark the node's category, so its children
-    carry them. The tvg-id is the nearest JSON_TVG_ID_KEYS string. A node with a license/DRM key, or a Kodi DRM pair
-    on the URL, marks its own URLs DRM, not its children's (a root "license" is the list's content licence; a clearkey
-    channel's "fallback" is its non-DRM variant); a site root is not a stream."""
+    an ancestor's name), the name rule (NSFW_NAME) on its name and tvg-name keys (JSON_NSFW_NAME_KEYS, URLs removed)
+    and a true nsfw/adult flag are NSFW signals; they mark the node's category, so its children carry them. The tvg-id
+    is the nearest JSON_TVG_ID_KEYS string. A node with a license/DRM key, or a Kodi DRM pair on the URL, marks its own
+    URLs DRM, not its children's (a root "license" is the list's content licence; a clearkey channel's "fallback" is
+    its non-DRM variant); a site root is not a stream."""
     stack = [(data, ("", "-", ""))]
     while stack:
         node, context = stack.pop()
@@ -409,8 +413,9 @@ def parse_json_list(data: object, source: str) -> Iterator[dict[str, str]]:
         name = next((node[k] for k in JSON_NAME_KEYS if isinstance(node.get(k), str)), context[0])
         tvg_id = next((node[k] for k in JSON_TVG_ID_KEYS if isinstance(node.get(k), str)), context[2])
         text = URL_IN_TEXT.sub(" ", " ".join(v for v in node.values() if isinstance(v, str)))
+        names = URL_IN_TEXT.sub(" ", " ".join(node[k] for k in JSON_NSFW_NAME_KEYS if isinstance(node.get(k), str)))
         # Flags are scalars only: str() of a nested subtree would cost its whole size on every level.
-        nsfw = bool(NSFW_TEXT.search(text)) or any(
+        nsfw = bool(NSFW_TEXT.search(text) or NSFW_NAME.search(names)) or any(
             JSON_ADULT_FLAG.fullmatch(str(k)) and isinstance(v, (str, int))
             and str(v).strip().lower() in ("true", "1", "yes") for k, v in node.items())
         category = _category((_json_category(node), context[1]), nsfw)

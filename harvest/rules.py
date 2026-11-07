@@ -96,7 +96,6 @@ NSFW_NAME = re.compile(r"xxx|" + _NSFW_TERMS, re.IGNORECASE)
 # The same terms in an entry's other text (attribute values, JSON fields), where random ids live (a YouTube channel
 # "UCXXxRH...", an imgur "7IxXX6f"): there "xxx" must start a word.
 NSFW_TEXT = re.compile(r"(?<![a-z0-9])xxx|" + _NSFW_TERMS, re.IGNORECASE)
-NSFW_CATEGORIES = {"xxx", "adult", "erotic", "nsfw"}  # whole category tokens
 ADULT_WORD = re.compile(r"\badult\b(?!\s*swim)", re.IGNORECASE)  # free-text group-titles ("Adult Channels")
 
 DRM_SCHEMES = r"widevine|clearkey|playready|fairplay"
@@ -274,10 +273,9 @@ def token_shaped(text: str) -> bool:
 
 
 def nsfw_category(text: str) -> bool:
-    """Whether a category cell names adult content: a listed token, an NSFW name term, or the word "adult" (not Adult
-    Swim). Pulled lists' group-titles are free text ("XXX Movies", "Adult Channels")."""
-    tokens = {c.strip() for c in re.split(r"[;,/|]", text.lower())}
-    return bool(tokens & NSFW_CATEGORIES or NSFW_NAME.search(text) or ADULT_WORD.search(text))
+    """Whether a category cell names adult content: an NSFW name term or the word "adult" (not Adult Swim). Pulled
+    lists' group-titles are free text ("XXX Movies", "Adult Channels")."""
+    return bool(NSFW_NAME.search(text) or ADULT_WORD.search(text))
 
 
 def vouches(url: str) -> bool:
