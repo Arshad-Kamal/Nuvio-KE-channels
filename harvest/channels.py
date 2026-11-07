@@ -8,8 +8,8 @@ exactly one channels.json channel; else empty. A row whose channel key or tvg-id
 or marks NSFW (Channels._nsfw) moves bucket; so does a row whose key names no channels.json channel (empty,
 "<service>:<id>") and whose name (any copy's) is an NSFW channel's name or alt name in any country (Spec 60 D19 audit:
 iptv-org lists no stream for Pluto DE's erotic channels, so their provider ids map to nothing). spread_nsfw then moves
-every URL holding the FAST channel id of an nsfw row (Spec 60 D20). Every value taken from iptv-org's files is cleaned
-with lists.cell before it is published.
+every URL holding a FAST channel id an nsfw row's URL holds (Spec 60 D20). Every value taken from iptv-org's files is
+cleaned with lists.cell before it is published.
 """
 import re
 import unicodedata
@@ -56,7 +56,9 @@ def provider_id(url: str) -> str | None:
     if host == "jmp2.uk" and (slug := JMP2_PATH.fullmatch(path)):
         return f"{JMP2_SLUGS[slug[1]]}:{slug[2].lower()}"
     if host in ("i.mjh.nz", "jmp2.uk") and (named := SERVICE_PATH.fullmatch(path)):
-        return f"{SERVICE_DIRS[named[1].lower()]}:{named[2].lower()}"
+        service, ident = SERVICE_DIRS[named[1].lower()], named[2].lower()
+        if _channel_id(service, ident):  # not a playlist such as /PlutoTV/us.m3u8
+            return f"{service}:{ident}"
     if (host == "pluto.tv" or host.endswith(".pluto.tv")) and (channel := PLUTO_PATH.search(path)):
         return f"pluto:{channel[1].lower()}"
     if host == "i.mjh.nz" and path.startswith("/.r/") and len(path) > 4:
@@ -88,14 +90,22 @@ def _to_nsfw(row: dict) -> None:
         row["_bucket"], row["reason"] = "nsfw", "nsfw"
 
 
-def fast_id(url: str) -> str | None:
-    """The FAST channel id a URL names (provider_id; a Plex key's channel part, its lineup part varies), or None when
-    the URL names none or the id lacks its service's shape (FAST_ID_SHAPES; .r slugs are names, never ids)."""
-    service, _, ident = (provider_id(url) or "").partition(":")
+def _channel_id(service: str, ident: str) -> str | None:
+    """The channel id in the ident of a provider id when it has its service's shape (FAST_ID_SHAPES; .r slugs are
+    names, never ids). A Plex key needs both parts and gives its channel part: the lineup part is shared by every
+    channel of the lineup."""
     if service == "plex":
-        ident = ident.rpartition("-")[2]
+        _, separator, ident = ident.rpartition("-")
+        if not separator:
+            return None
     shape = FAST_ID_SHAPES.get(service)
     return ident if shape and shape.fullmatch(ident) else None
+
+
+def fast_id(url: str) -> str | None:
+    """The FAST channel id a URL names (provider_id, _channel_id), or None."""
+    service, _, ident = (provider_id(url) or "").partition(":")
+    return _channel_id(service, ident)
 
 
 def _url_words(url: str) -> set[str]:
@@ -103,15 +113,26 @@ def _url_words(url: str) -> set[str]:
     return {word.decode() for layer in egress.layers(url) for word in URL_WORD.findall(layer.lower())}
 
 
-def spread_nsfw(rows: Iterable[dict]) -> None:
-    """Moves to nsfw every row whose URL holds, as a whole word, the FAST channel id (fast_id) of an nsfw row, however
-    the URL spells the channel (a stitcher path, a per-service path, a query value): the verdict belongs to the channel
-    (Spec 60 D20). Ids only, never a name or channel key, so a mislabelled list row cannot drag a broadcaster along."""
+def spread_nsfw(rows: Iterable[dict]) -> tuple[int, int]:
+    """Moves to nsfw every row whose URL holds, as a whole word, a FAST channel id an nsfw row's URL holds, however
+    either spells the channel (a stitcher path, a per-service path, a proxy's query value, any case): the verdict
+    belongs to the channel (Spec 60 D20). An id is a fast_id of some row; a Plex lineup part never is (one row naming a
+    lineup would move the whole lineup). Ids only, never a name or channel key: a mislabelled row drags at most the
+    FAST channels its URL names. Returns (ids spread, rows moved)."""
     rows = list(rows)
-    ids = {ident for row in rows if row["_bucket"] == "nsfw" and (ident := fast_id(row["url"]))}
+    known, lineups = set(), set()
     for row in rows:
-        if row["_bucket"] != "nsfw" and not ids.isdisjoint(_url_words(row["url"])):
-            _to_nsfw(row)
+        service, _, ident = (provider_id(row["url"]) or "").partition(":")
+        if channel := _channel_id(service, ident):
+            known.add(channel)
+            if service == "plex":
+                lineups.add(ident.rpartition("-")[0])
+    known -= lineups
+    ids = {word for row in rows if row["_bucket"] == "nsfw" for word in _url_words(row["url"]) & known}
+    moved = [row for row in rows if row["_bucket"] != "nsfw" and not ids.isdisjoint(_url_words(row["url"]))]
+    for row in moved:
+        _to_nsfw(row)
+    return len(ids), len(moved)
 
 
 def _unique(pairs: Iterable[tuple[object, str]]) -> dict:

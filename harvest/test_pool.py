@@ -697,23 +697,36 @@ class ChannelsTest(unittest.TestCase):
     def test_nsfw_reaches_every_url_holding_the_fast_id_of_an_nsfw_row(self):
         lineup, channel = "608049aefa2b8ae93c2c3a63", "64695233f73356567a64ce90"
         other_channel = "6111b06a8f945c002c45dd12"
+        proxied, roku, random_hex = "5f12345678abcdef01234567", "b484db42f3d31b6dc2f604d453c694a0", "ab" * 12
         nsfw = [pool_row(f"https://jmp2.uk/plu-{PLUTO_ID}.m3u8", bucket="nsfw"),
                 pool_row(f"https://jmp2.uk/plex-{lineup}-{channel}.m3u8", bucket="nsfw"),
+                pool_row("https://jmp2.uk/sam-USBC4400020H7.m3u8", bucket="nsfw"),
+                pool_row(f"https://jmp2.uk/rok-{roku}.m3u8", bucket="nsfw"),
+                # the only nsfw spelling of a channel: a proxy's encoded query value, an uppercase slug
+                pool_row(f"https://proxy.example/p?u=https%3A%2F%2Fjmp2.uk%2FPLU-{proxied.upper()}.m3u8",
+                         bucket="nsfw"),
                 pool_row("https://jmp2.uk/stvp-GB1", bucket="nsfw"),  # too short to be an id
-                pool_row("https://adult.example/x.m3u8", bucket="nsfw")]  # no FAST id
+                pool_row(f"https://adult.example/{random_hex}/x.m3u8", bucket="nsfw"),  # hex that is no FAST id
+                # a Plex lineup named as a channel: by a one-part Plex key, or shaped as a Pluto id
+                pool_row(f"https://jmp2.uk/plex-{lineup}.m3u8", bucket="nsfw"),
+                pool_row(f"https://jmp2.uk/plu-{lineup}.m3u8", bucket="nsfw")]
         reached = [
             pool_row(f"https://service-stitcher.clusters.pluto.tv/stitch/hls/channel/{PLUTO_ID}/master.m3u8"),
             pool_row(f"https://i.mjh.nz/PlutoTV/{PLUTO_ID}-alt.m3u8"),
             pool_row(f"https://proxy.example/play?u=pluto%2Fchannel%2F{PLUTO_ID.upper()}%2Fm.m3u8"),  # a query value
-            pool_row(f"https://i.mjh.nz/Plex/0123456789abcdef01234567-{channel}.m3u8", bucket="private")]  # lineup
+            pool_row(f"https://i.mjh.nz/Plex/0123456789abcdef01234567-{channel}.m3u8", bucket="private"),  # lineup
+            pool_row("https://i.mjh.nz/SamsungTVPlus/USBC4400020H7.m3u8"),
+            pool_row(f"https://cdn.example.org/roku/{roku.upper()}/index.m3u8"),
+            pool_row(f"https://jmp2.uk/plu-{proxied}.m3u8")]  # its canonical row
         kept = [pool_row(f"https://jmp2.uk/plu-{PLUTO_ID[::-1]}.m3u8"),  # another Pluto channel
                 pool_row(f"https://jmp2.uk/plex-{lineup}-{other_channel}.m3u8"),  # same lineup, another channel
                 pool_row(f"https://cdn.example.org/x{PLUTO_ID}.m3u8"),  # the id inside a longer word
                 pool_row("https://jmp2.uk/stvp-GB1.m3u8"), pool_row("https://cdn.example.org/gb1/x.m3u8"),
-                pool_row("https://adult.example/y.m3u8")]  # the nsfw non-FAST row's host
+                pool_row(f"https://cdn.example.org/{random_hex}/y.m3u8"),
+                pool_row("https://adult.example/y.m3u8")]  # an nsfw non-FAST row's host
         for row in kept:
             row["channel"] = "Same.us"  # a shared channel key does not spread
-        spread_nsfw(nsfw + reached + kept)
+        self.assertEqual(spread_nsfw(nsfw + reached + kept), (5, len(reached)))  # (ids spread, rows moved)
         self.assertEqual([(r["_bucket"], r["reason"]) for r in reached], [("nsfw", "nsfw")] * len(reached))
         self.assertEqual([r["_bucket"] for r in kept], ["public"] * len(kept))
 
@@ -743,12 +756,17 @@ class ChannelsTest(unittest.TestCase):
         self.assertEqual(provider_id(f"https://i.mjh.nz/PlutoTV/{PLUTO_ID}-alt.m3u8"), f"pluto:{PLUTO_ID}")
         self.assertEqual(provider_id(f"https://jmp2.uk/PlutoTV/{PLUTO_ID}.m3u8"), f"pluto:{PLUTO_ID}")
         self.assertEqual(provider_id("https://i.mjh.nz/SamsungTVPlus/USBC4400020H7.m3u8"), "samsung:usbc4400020h7")
-        self.assertEqual(provider_id("https://i.mjh.nz/Plex/aa-bb.m3u8"), "plex:aa-bb")
-        self.assertIsNone(provider_id("https://i.mjh.nz/PlutoTV/.channels.json"))
+        plex_key = f"{PLUTO_ID[::-1]}-{PLUTO_ID}"
+        self.assertEqual(provider_id(f"https://i.mjh.nz/Plex/{plex_key}.m3u8"), f"plex:{plex_key}")
+        for url in ("https://i.mjh.nz/PlutoTV/.channels.json", "https://i.mjh.nz/PlutoTV/us.m3u8",
+                    "https://i.mjh.nz/SamsungTVPlus/all.m3u8", f"https://i.mjh.nz/Plex/{PLUTO_ID}.m3u8"):
+            self.assertIsNone(provider_id(url), url)  # playlists and a lone Plex lineup are no channel
         self.assertEqual(fast_id("https://i.mjh.nz/SamsungTVPlus/USBC4400020H7.m3u8"), "usbc4400020h7")
-        self.assertEqual(fast_id(f"https://jmp2.uk/plex-{PLUTO_ID[::-1]}-{PLUTO_ID}.m3u8"), PLUTO_ID)  # channel part
+        self.assertEqual(fast_id(f"https://jmp2.uk/plex-{plex_key}.m3u8"), PLUTO_ID)  # channel part
+        self.assertEqual(fast_id("https://jmp2.uk/rok-b484db42f3d31b6dc2f604d453c694a0.m3u8"),
+                         "b484db42f3d31b6dc2f604d453c694a0")
         for url in ("https://i.mjh.nz/.r/maori.m3u8", "https://jmp2.uk/stvp-GB1", "https://jmp2.uk/rok-abc.m3u8",
-                    "https://iptv.example/a.m3u8"):
+                    "https://iptv.example/a.m3u8", f"https://jmp2.uk/plex-{PLUTO_ID}.m3u8"):
             self.assertIsNone(fast_id(url), url)
 
     def test_iptv_org_channel_strings_are_cleaned_and_a_later_tvg_id_keys_the_row(self):

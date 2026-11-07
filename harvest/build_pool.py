@@ -8,12 +8,12 @@ seeds' stream rows (<private>/seed/research-{public,private,nsfw}.tsv, extract_r
 endpoint that is a list file (lists.list_target), fetched now. Every copy is bucketed by rules.verdict (a row of a
 list the research put in nsfw, or private as a listed pirate list, and a research stream row citing such a list,
 also carries that list's verdict: lists.list_taints), copies are merged by exact URL (rules.merge), then each row
-gets its channel key and the iptv-org blocklist/NSFW joins, and NSFW spreads to every URL holding an nsfw row's FAST
-channel id (channels.py). streams.tsv is the only public output (D16). Fetching iptv-org's API (streams, channels,
-blocklist) or a FAST index failing fails the run (exit 1); a research list failing is recorded in pulls.tsv. Before
-anything is written every public row is checked for this machine's egress IP (egress.py); a hit or a failed lookup
-fails the run and nothing is written. A private repo that is the public checkout (swapped arguments) is refused
-(extract_research.private_repo). Outputs (plain TSV, values verbatim):
+gets its channel key and the iptv-org blocklist/NSFW joins, and NSFW spreads to every URL holding a FAST channel id
+an nsfw row's URL holds (channels.py). streams.tsv is the only public output (D16). Fetching iptv-org's API (streams,
+channels, blocklist) or a FAST index failing fails the run (exit 1); a research list failing is recorded in pulls.tsv.
+Before anything is written every public row is checked for this machine's egress IP (egress.py); a hit or a failed
+lookup fails the run and nothing is written. A private repo that is the public checkout (swapped arguments) is
+refused (extract_research.private_repo). Outputs (plain TSV, values verbatim):
   <public>/pool/streams.tsv     public candidate streams (extract_research.OUT_COLUMNS + channel)
   <private>/pool/private.tsv    private rows with their reason
   <private>/pool/nsfw.tsv       NSFW rows
@@ -143,7 +143,7 @@ def main() -> int:
     for row in kept.values():
         joined.apply(row, row["_tvg_ids"], row["_names"])
         row["seen_in"] = seen_in(row["seen_in"])
-    spread_nsfw(kept.values())
+    spread = spread_nsfw(kept.values())
 
     def pick(name: str) -> list[dict]:
         return [row for row in kept.values() if row["_bucket"] == name]
@@ -156,18 +156,18 @@ def main() -> int:
                args.private / "pool" / "nsfw.tsv": tsv(pick("nsfw"), POOL_COLUMNS),
                args.private / "pool" / "pulls.tsv": tsv(pulls, PULL_COLUMNS)}
     write_all(outputs)
-    report(kept, pulls, fast)
+    report(kept, pulls, fast, spread)
     return 0
 
 
-def report(kept: dict[str, dict], pulls: list[dict], fast: dict[str, list]) -> None:
+def report(kept: dict[str, dict], pulls: list[dict], fast: dict[str, list], spread: tuple[int, int]) -> None:
     buckets = collections.Counter(row["_bucket"] for row in kept.values())
     reasons = collections.Counter((row["_bucket"], row["reason"].split(":")[0]) for row in kept.values())
     statuses = collections.Counter(p["status"].split(":")[0] if not p["class"].startswith("skip") else p["class"]
                                    for p in pulls)
     print(f"unique URLs {len(kept)}: public {buckets['public']}, private {buckets['private']}, nsfw {buckets['nsfw']}; "
           f"FAST rows {', '.join(f'{s} {len(r)}' for s, r in fast.items())}; channel keys "
-          f"{sum(1 for r in kept.values() if r['channel'])}")
+          f"{sum(1 for r in kept.values() if r['channel'])}; NSFW spread: {spread[0]} FAST ids, {spread[1]} rows moved")
     print(f"research list endpoints {len(pulls)}: " + ", ".join(f"{k} {n}" for k, n in sorted(statuses.items())))
     for (name, reason), count in sorted(reasons.items()):
         print(f"  {name} {reason or '-'}: {count}")
