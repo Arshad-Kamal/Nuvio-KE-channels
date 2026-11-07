@@ -21,7 +21,8 @@ from dataclasses import dataclass
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from allowlist import IPTV_ORG_API, IPTV_ORG_STREAMS, MAX_DOWNLOAD, has_suffix
-from rules import DRM, M3U_FILE, STATIC_SOURCES, Verdict, stricter, url_rejection
+from rules import (DRM, LIST_KINDS, M3U_FILE, STATIC_SOURCES, Verdict, nsfw_category, stricter, token_shaped,
+                   url_rejection)
 
 MAX_GUNZIPPED = MAX_DOWNLOAD  # real lists are far smaller; 8 parallel fetches stay within a few hundred MB
 FETCH_TIMEOUT = 30  # per socket operation
@@ -151,7 +152,7 @@ def list_taint(research: Mapping[str, str]) -> Verdict | None:
 
 def list_taints(research_lists: Iterable[Mapping[str, str]]) -> dict[str, Verdict | None]:
     """list_url -> the strictest list_taint of every research list row naming that file. Rows pulled from the file
-    and research stream rows citing it (source_page, looked up through list_url) carry it."""
+    and research stream rows citing it (cited_taint) carry it."""
     taints: dict[str, Verdict | None] = {}
     for research in research_lists:
         key = list_url(research["url"])
@@ -159,17 +160,21 @@ def list_taints(research_lists: Iterable[Mapping[str, str]]) -> dict[str, Verdic
     return taints
 
 
+def cited_taint(taints: Mapping[str, Verdict | None], row: Mapping[str, str]) -> Verdict | None:
+    """The taint a research stream row carries from the research list its source page names (None for list rows)."""
+    return None if row["kind"] in LIST_KINDS else taints.get(list_url(row["source_page"]))
+
+
 def list_target(row: Mapping[str, str]) -> tuple[str | None, str]:
     """(URL to fetch, class) for one research list-endpoint/api row; the URL (list_url's spelling) is None when it is
     not pulled and the class says why."""
-    url = row["url"].strip()
+    url = list_url(row["url"])
     if not re.match(r"https?://", url, re.IGNORECASE):
         return None, "skip:not-http"
     if "{" in url:
         return None, "skip:template"
     if IPTV_ORG_OWN.match(url):
         return None, "skip:iptv-org"
-    url = list_url(url)
     try:
         parts = urlsplit(url)
         host, path = (parts.hostname or "").lower(), unquote(parts.path)
@@ -183,10 +188,11 @@ def list_target(row: Mapping[str, str]) -> tuple[str | None, str]:
         return None, "skip:page"
     if path.startswith("/.r/") or has_suffix(host, REDIRECTORS):
         return None, "skip:redirector"
-    # Fetching a panel URL that carries someone's login would use it (Spec 60: probing leaked credentials waits for
-    # Arshad's answer).
+    # Fetching a URL that carries someone's login or session would use it (Spec 60 D16, D17).
     if (url_rejection(url) or ("", ""))[1] == "credential":
         return None, "skip:credential"
+    if token_shaped(url):
+        return None, "skip:token"
     if has_suffix(host, STATIC_SOURCES):
         return url, "static"
     if M3U_FILE.search(path) or row["format"].lower().startswith("m3u"):
@@ -272,44 +278,57 @@ def fetch(url: str) -> Fetched:
 EXTINF_ATTRIBUTE = re.compile(r'(?<![\w-])([\w-]+)\s*=\s*"([^"]*)"')
 # Unquoted or half-quoted attributes before the name (tvg-chno=69, tvg-id=Action 24.gr"): split on their keys.
 BARE_KEY = re.compile(r"(?<![\w-])((?:tvg|group)-[\w-]+)\s*=", re.IGNORECASE)
+# A leading-comma list's run of unquoted attributes between commas before the name; possessive, so linear.
+BARE_RUN = re.compile(r"(?:[ \t,]*+(?:tvg|group)-[\w-]++\s*+=[^,]*+)++", re.IGNORECASE)
 DURATION = re.compile(r"^\s*-?\d+(?:\.\d+)?")
 
 
-def _extinf(line: str) -> tuple[dict[str, str], str]:
-    """Attributes and name of an #EXTINF line. Quoted attributes are read wherever they stand (some lists write
-    '#EXTINF:-1,tvg-id="X",tvg-logo="...",Name') and removed; the name follows the first comma left, leading commas
-    dropped, so a name holding a comma ("CNN, East") stays whole. What stands before that comma is the duration and
-    unquoted attributes: each value runs to the next key, stray quotes stripped. A line with no comma left is all
-    name."""
+def _extinf(line: str) -> tuple[dict[str, str], str, str]:
+    """(attributes, name, leftover) of an #EXTINF line. Quoted attributes are read wherever they stand (some lists
+    write '#EXTINF:-1,tvg-id="X",tvg-logo="...",Name') and removed; the name follows the first comma left, leading
+    commas dropped, so a name holding a comma ("CNN, East") stays whole. Before the name stand the duration and
+    unquoted attributes, each value running to the next key, stray quotes stripped; leading-comma lists put them after
+    the duration's comma, and a line with no comma left is read the same way when it starts with one. Leftover = the
+    rest of that part (a mispaired quote's spill, an unknown key), for the NSFW rules (parse_m3u)."""
     attributes = {k.lower(): v for k, v in EXTINF_ATTRIBUTE.findall(line)}
     rest = DURATION.sub("", EXTINF_ATTRIBUTE.sub("", line[len("#EXTINF:"):]))
     head, comma, name = rest.partition(",")
     if not comma:
-        return attributes, rest.strip()
-    parts = BARE_KEY.split(head)  # [junk, key, value, key, value, ...]
+        if not BARE_KEY.match(rest.strip()):
+            return attributes, rest.strip(), ""
+        head, name = rest, ""
+    name = name.lstrip(" \t,")
+    if run := BARE_RUN.match(name):
+        head, name = f"{head} {run.group()}", name[run.end():].lstrip(" \t,")
+    parts = BARE_KEY.split(head)  # [leftover, key, value, key, value, ...]
     for key, value in zip(parts[1::2], parts[2::2]):
         attributes.setdefault(key.lower(), value.strip().strip('"').strip())
-    return attributes, name.lstrip(" \t,").strip()
+    return attributes, name.strip(), parts[0].strip(' \t,"')
 
 
-def _stream_url(token: str) -> tuple[str, list[tuple[str, str]]] | None:
-    """The URL of one list entry and the (name, value) pairs of a Kodi-style "|Name=value&..." suffix; None for an
-    unclean URL, an image or a web page."""
+def _stream_url(token: str) -> tuple[str, list[tuple[str, str]], bool] | None:
+    """The URL of one list entry, the (name, value) pairs of a Kodi-style "|Name=value&..." suffix, and whether a pair
+    names DRM (NS Player's drmScheme/drmLicense, license keys); None for an unclean URL, an image or a web page."""
     url, _, kodi = token.partition("|")
     if clean_url(url) is None or NOT_STREAM.search(url):
         return None
-    pairs = [pair.partition("=") for pair in kodi.split("&") if pair]
-    return url, [(name, unquote(value)) for name, _, value in pairs]
+    pairs = [(name, unquote(value)) for name, _, value in (pair.partition("=") for pair in kodi.split("&") if pair)]
+    return url, pairs, any(_drm_key(name) for name, _ in pairs)
+
+
+def _drm_key(key: object) -> bool:
+    """Whether a key names DRM or a license (a JSON key, a Kodi suffix pair name)."""
+    return bool(DRM.search(str(key))) or "license" in str(key).lower()
 
 
 def parse_m3u(text: str, source: str) -> Iterator[dict[str, str]]:
     """Rows of an extended M3U playlist (#EXTINF + URL line). Directives may come before or after #EXTINF (Kodi lists
     put #KODIPROP first), so an entry's state is cleared only after its URL line."""
-    attributes, name, headers, drm, group = {}, "", [], False, ""
+    attributes, name, leftover, headers, drm, group = {}, "", "", [], False, ""
     for raw in text.splitlines():
         line = raw.strip().lstrip("\ufeff")
         if line.startswith("#EXTINF"):
-            attributes, name = _extinf(line)
+            attributes, name, leftover = _extinf(line)
         elif line.startswith("#EXTVLCOPT:"):
             option, _, value = line[len("#EXTVLCOPT:"):].partition("=")
             headers.append((option, value))
@@ -320,17 +339,20 @@ def parse_m3u(text: str, source: str) -> Iterator[dict[str, str]]:
         elif line and not line.startswith("#"):
             found = _stream_url(line.split()[0])
             if found:
-                url, kodi_headers = found
+                url, kodi_headers, kodi_drm = found
+                # The #EXTINF leftover counts only as an NSFW signal; otherwise it is junk, not a category.
+                category = "; ".join(filter(None, (attributes.get("group-title") or group,
+                                                   leftover if nsfw_category(leftover) else "")))
                 yield row(name or attributes.get("tvg-name", ""), url, source,
                           country=attributes.get("tvg-country", "-"), language=attributes.get("tvg-language", "-"),
-                          category=attributes.get("group-title") or group or "-",
-                          headers=headers_cell(headers + kodi_headers),
-                          notes="KODIPROP license (DRM)" if drm else "-", tvg_id=attributes.get("tvg-id", ""))
-            attributes, name, headers, drm, group = {}, "", [], False, ""
+                          category=category or "-", headers=headers_cell(headers + kodi_headers),
+                          notes="KODIPROP license (DRM)" if drm else "license pair (DRM)" if kodi_drm else "-",
+                          tvg_id=attributes.get("tvg-id", ""))
+            attributes, name, leftover, headers, drm, group = {}, "", "", [], False, ""
 
 
 def _json_category(node: dict) -> str | None:
-    """The node's category: the first category/group/genre key holding a string or a list of strings."""
+    """The node's own category: the first category/group/genre key holding a string or a list of strings."""
     for key in JSON_CATEGORY_KEYS:
         value = node.get(key)
         if isinstance(value, list):
@@ -341,9 +363,9 @@ def _json_category(node: dict) -> str | None:
 
 
 def parse_json_list(data: object, source: str) -> Iterator[dict[str, str]]:
-    """Rows of a JSON list of any shape: string URLs under stream-like keys, named by the nearest name key and
-    categorised by the nearest category key (a group's "XXX" reaches the NSFW rules). A node with a license/DRM key
-    marks its URLs DRM; a site root is not a stream."""
+    """Rows of a JSON list of any shape: string URLs under stream-like keys, named by the nearest name key; the category
+    joins every ancestor's own (a group's "XXX" survives a child's "Movies" and reaches the NSFW rules), capped. A node
+    with a license/DRM key, or a Kodi DRM pair on the URL, marks its URLs DRM; a site root is not a stream."""
     stack = [(data, ("", "-"))]
     while stack:
         node, context = stack.pop()
@@ -353,8 +375,9 @@ def parse_json_list(data: object, source: str) -> Iterator[dict[str, str]]:
         if not isinstance(node, dict):
             continue
         name = next((node[k] for k in JSON_NAME_KEYS if isinstance(node.get(k), str)), context[0])
-        category = _json_category(node) or context[1]
-        drm = any(DRM.search(str(key)) or "license" in str(key).lower() for key in node)
+        own = _json_category(node)
+        category = "; ".join(c for c in (context[1], own) if c and c != "-")[:MAX_NAME] or "-"
+        drm = any(_drm_key(key) for key in node)
         children = []
         for key, value in node.items():
             if isinstance(value, str):
@@ -363,7 +386,7 @@ def parse_json_list(data: object, source: str) -> Iterator[dict[str, str]]:
                 if (found and JSON_URL_KEY.search(key) and not JSON_NOT_STREAM_KEY.search(key)
                         and urlsplit(found[0]).path.strip("/")):
                     yield row(name, found[0], source, category=category, headers=headers_cell(found[1]),
-                              notes="license key (DRM)" if drm else "-")
+                              notes="license key (DRM)" if drm or found[2] else "-")
             elif isinstance(value, (dict, list)):
                 children.append((value, (name, category)))
         stack.extend(reversed(children))

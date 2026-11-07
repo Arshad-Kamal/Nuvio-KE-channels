@@ -79,7 +79,8 @@ class BucketTest(unittest.TestCase):
                     "https://www.stvr.sk/json/live5f.json?c=1&b=mozilla&p=win&f=0&d=1",  # p= is not a password
                     "https://rtmp.apa.tv/@pagroup!23.m3u8",  # "@" in the path, not userinfo
                     "https://news.example.org/widget.php?id=4"):  # not get.php
-            # A query sends the row private under D15, but past every deny rule.
+            # Past every deny rule: public, or private only for its query (D15).
+            self.assertEqual(b(url)[0] == "public", not rules.has_parameters(url), url)
             self.assertIn(b(url)[1], ("iptv-org-host", "reviewed-host", "unreviewed-query"), url)
 
     def test_listed_hosts_are_private(self):
@@ -115,7 +116,7 @@ class BucketTest(unittest.TestCase):
         self.assertEqual(b("https://x.example/a.m3u8", notes="Widevine", kind="other"), ("private", "drm"))
 
     def test_a_negated_mention_does_not_cancel_a_positive_one(self):
-        # ORF 1 (research-streams.tsv before the fix): FairPlay DRM, the note also names a non-DRM variant.
+        # ORF 1 (the public research seed before the fix): FairPlay DRM, the note also names a non-DRM variant.
         self.assertEqual(b("https://orf1.mdn.ors.at/orf/orf1/drmqxa/manifest.m3u8", name="ORF 1 (DRM)",
                            notes="FairPlay SAMPLE-AES DRM; non-DRM qxa returns 403"), ("private", "drm"))
         self.assertEqual(b("https://x.example/a.m3u8", name="Channel (DRM)"), ("private", "drm"))
@@ -453,7 +454,7 @@ class MainTest(unittest.TestCase):
             (run / "01-lane.md").write_text("# r\n\n```tsv\n" + tsv_block + "```\n", encoding="utf-8")
             streams = Path(d) / "streams.json"
             streams.write_text(json.dumps([{"url": u} for u in listed]), encoding="utf-8")
-            argv = ["x", "--streams", str(streams), str(Path(d) / "pub"), str(Path(d) / "priv"), str(run)]
+            argv = ["x", "--streams", str(streams), str(Path(d) / "priv"), str(run)]
             lookup = (mock.patch.object(egress, "known_ips", side_effect=egress.LookupFailed("down")) if ips is None
                       else mock.patch.object(egress, "known_ips", return_value=set(ips)))
             with mock.patch.object(sys, "argv", argv), lookup, redirect_stdout(io.StringIO()), \
@@ -467,9 +468,8 @@ class MainTest(unittest.TestCase):
                                       + tsv_line("B", "https://b.example/b.m3u8") + "\n",
                                       ["https://a.example/a.m3u8"])
         self.assertEqual(code, 0)
-        self.assertEqual(sorted(written), ["research-nsfw.tsv", "research-private.tsv", "research-sources.tsv",
-                                           "research-streams.tsv"])
-        self.assertIn("https://a.example/a.m3u8\t", written["research-streams.tsv"])
+        self.assertEqual(sorted(written), ["research-nsfw.tsv", "research-private.tsv", "research-public.tsv"])
+        self.assertIn("https://a.example/a.m3u8\t", written["research-public.tsv"])
         self.assertIn("https://b.example/b.m3u8\t", written["research-private.tsv"])
 
     def test_a_skipped_line_holding_a_url_fails_the_run_before_writing(self):
@@ -483,17 +483,14 @@ class MainTest(unittest.TestCase):
             code, written = self.run_main(tsv_line(name, "https://a.example/a.m3u8") + "\n",
                                           ["https://a.example/a.m3u8"])
             self.assertEqual(code, 0)
-            self.assertIn("https://a.example/a.m3u8", written["research-streams.tsv"], name)
+            self.assertIn("https://a.example/a.m3u8", written["research-public.tsv"], name)
 
-    def test_the_egress_ip_in_a_public_row_fails_the_run_before_writing(self):
-        url = "https://a.example/live/3405803783/a.m3u8"  # public: iptv-org lists this exact URL
-        code, written = self.run_main(tsv_line("A", url) + "\n", [url])
-        self.assertEqual((code, written), (1, {}))
-
-    def test_a_failed_egress_lookup_fails_the_run_before_writing(self):
-        code, written = self.run_main(tsv_line("A", "https://a.example/a.m3u8") + "\n",
-                                      ["https://a.example/a.m3u8"], ips=None)
-        self.assertEqual((code, written), (1, {}))
+    def test_seeds_are_private_and_publish_nothing(self):
+        # D16: build_pool alone publishes (and runs the egress gate); a seed run succeeds with no egress lookup.
+        code, written = self.run_main(tsv_line("A", "https://a.example/a.m3u8") + "\n", ["https://a.example/a.m3u8"],
+                                      ips=None)
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(written), ["research-nsfw.tsv", "research-private.tsv", "research-public.tsv"])
 
     def test_a_stream_citing_an_nsfw_research_list_in_another_spelling_is_nsfw(self):
         listed = "\t".join(["Erotica lists", "https://raw.githubusercontent.com/o/r/main/x.m3u"] + ["-"] * 3
@@ -503,7 +500,7 @@ class MainTest(unittest.TestCase):
         code, written = self.run_main(listed + "\n" + cited + "\n", ["https://a.example/a.m3u8"])
         self.assertEqual(code, 0)
         self.assertIn("https://a.example/s.m3u8\t", written["research-nsfw.tsv"])
-        self.assertNotIn("https://a.example/s.m3u8\t", written["research-streams.tsv"])
+        self.assertNotIn("https://a.example/s.m3u8\t", written["research-public.tsv"])
 
 
 if __name__ == "__main__":

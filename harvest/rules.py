@@ -11,8 +11,8 @@ Every candidate row lands in exactly one bucket; nothing is dropped:
 Rules match the row's own URL, name, category and source page. A list's notes often describe rows inside it
 ("contains NSFW, exclude"), so notes only count for DRM and minted URLs on a single stream row. The deny rules below
 stay as a second filter behind the allowlist; url_rejection() also decides which iptv-org URLs vouch for a host.
-TOKEN_URL is no longer the gate for query strings (D15): a deny-list of token keys stayed incomplete over three review
-rounds, so a non-iptv-org URL with a query is private whatever its keys; TOKEN_URL still judges paths and cells.
+Query strings: a URL iptv-org does not list verbatim with a query is private whatever its keys (D15,
+has_parameters); TOKEN_URL judges paths, fragments and the other published cells (D16).
 
 One URL can be found several times (copies). A verdict about the stream itself (its URL, DRM, minted notes, the
 allowlist, NSFW) holds for every copy; a verdict about one copy only (it came from a listed pirate list or a dynamic
@@ -50,7 +50,7 @@ CREDENTIAL = re.compile(
 # A URL can carry another one in an encoded layer: iptv-org listed tvstitch.com URLs whose base64 ?source= held a pay
 # restream's per-subscriber ip/id/secret and a JWT with the subscriber's phone number. CREDENTIAL and these claims
 # are also searched in the decoded layers (egress.layers, egress.decoded_runs).
-JWT_PAYLOAD = re.compile(r"eyJ[\w-]{8,}\.(eyJ[\w-]+)")
+JWT_PAYLOAD = re.compile(r"(?<![\w-])eyJ[\w-]{8,}\.(eyJ[\w-]+)")  # starts once per word run: linear
 PERSONAL_CLAIM = re.compile(r"phone|mobile|msisdn|e?mail|^tel$|^(?:client_?)?ip$|^user_?(?:id|name)$|^uid$",
                             re.IGNORECASE)
 PERSONAL_VALUE = re.compile(r"[^@\s]+@[^@\s]+\.[a-z]{2,}|\+\d[\d -]{7,}\d", re.IGNORECASE)  # e-mail, +phone
@@ -97,6 +97,9 @@ ADULT_WORD = re.compile(r"\badult\b(?!\s*swim)", re.IGNORECASE)  # free-text gro
 
 DRM = re.compile(r"widevine|clearkey|playready|fairplay|sample-aes|\bcenc\b|license_url|kodiprop|\bdrm\b",
                  re.IGNORECASE)
+# DRM named in a stream URL's path (/LA7D/DRM/HLS/, cmaf_cenc00, playlist_cbcs.mpd): an encryption scheme there is a
+# variant name. Judged on URLs iptv-org does not list verbatim (D16): iptv-org vets its own.
+DRM_PATH = re.compile(r"\bdrm\b|(?<![a-z])(?:cenc|cbcs)(?![a-z])|widevine|playready|fairplay|clearkey", re.IGNORECASE)
 # Negated mentions ("non-DRM variant", "DRM-free") are removed before DRM is searched, so a note that says
 # both "FairPlay DRM" and "non-DRM qxa returns 403" still counts as DRM. A negated "DRM-free" ("not", "isn't",
 # "no longer", "never") is not a negation.
@@ -105,21 +108,24 @@ NOT_DRM = re.compile(r"(?<!not )(?<!n't )(?<!n\u2019t )(?<!longer )(?<!never )\b
 
 # Minted URLs (D12): made for one requester, possibly binding its IP (a TVP path token minted by the research
 # fetches held this machine's IP). Spec 60 W3: never publish them; recipes resolve them on the viewer's device.
-# 1. Token-shaped URLs, also percent-encoded: signing/session query or path keys (Akamai, Wowza, Wangsu ws*, Tencent
-#    tx*, S3, MediaTailor aws.sessionId, ad-stitcher streaming ids), a query value that is an IP address (an ad
-#    stitcher's ads.ip=<requester>: minted for whoever built the list), path-token markers, DAI pod-serving (/stream/<uuid>) and MediaTailor session paths,
-#    Dailymotion sec(...) paths, Wowza session chunklists, an epoch+hash pair (e=<epoch>&h=), JWTs anywhere.
+# 1. Token-shaped URLs, also percent-encoded: signing/session query, fragment or path keys (Akamai, Wowza, Wangsu ws*,
+#    Tencent tx*, S3, MediaTailor aws.sessionId, ad-stitcher streaming ids), a query value that is an IP address (an
+#    ad stitcher's ads.ip=<requester>: minted for whoever built the list), path-token markers (/token/, CloudFront's
+#    /_token/v1.<epoch>.<hmac>/), a path segment of base64 JSON (Rakuten/MediaTailor bitok/eyJ<session>), DAI
+#    pod-serving (/stream/<uuid>) and MediaTailor session paths, Dailymotion sec(...) paths, Wowza session chunklists,
+#    an epoch+hash pair (e=<epoch>&h=), JWTs anywhere.
 TOKEN_URL = re.compile(
-    r"[?&;/~](?:hdnts|hdnea|hdntl|__hdnea__|[a-z0-9_.-]*token[a-z0-9_]*|tkn|wmsauthsign|wowzatoken\w*|jwt|auth|auth_key|policy|"
+    r"[?&;/~#](?:hdnts|hdnea|hdntl|__hdnea__|[a-z0-9_.-]*token[a-z0-9_]*|tkn|wmsauthsign|wowzatoken\w*|jwt|auth|auth_key|policy|"
     r"signature|key-pair-id|expires|exp|sig|sign|md5|hash|hmac|acl|validto|nva|nvb|sid|session|[a-z_.]*sessionid|"
     r"_lsu_sa_|x-amz-[a-z-]+|[a-z_.-]*api[-_]?key|__token__|ws(?:secret|time)|tx(?:secret|time)|__gda__|ec_secure|st|secure|"
     r"nonce|[a-z_.]*streaming_?id)=|[?&]e=\d{9,}&h=|[?&]h=[0-9a-f]+&e=\d{9,}|"
     # a query value that is an IP address, IPv4 (with a port) or IPv6 (ads.ip=<viewer>), ending where the value does
-    # (also before a quote or a space: cells hold JSON and free text); bounded groups, so no backtracking blow-up
-    r"[?&;][^=&#;]*=(?:(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?|\[?(?:(?:[0-9a-f]{1,4}:){4,7}[0-9a-f]{1,4}|"
+    # (also before a quote or a space: cells hold JSON and free text). Linear: the key run holds no start character
+    # and the value groups are bounded.
+    r"[?&;][^=&#;?]*=(?:(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?|\[?(?:(?:[0-9a-f]{1,4}:){4,7}[0-9a-f]{1,4}|"
     r"(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,6})?::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,6})?)\]?)(?![\w.:-])|"
-    r"/(?:token|tkn|session|signature)/|/expires?/\d|/stream/[0-9a-f]{8}-[0-9a-f-]{27}|"
-    r"/v1/manifest/[^/]+/[^/]+/[0-9a-f]{8}-[0-9a-f-]{27}/|/sec\d?\(|chunklist_w\d|eyJ[\w-]{8,}\.eyJ",
+    r"/[_-]?(?:token|tkn|session|signature)/|/eyJ[\w-]{8,}|/expires?/\d|/stream/[0-9a-f]{8}-[0-9a-f-]{27}|"
+    r"/v1/manifest/[^/]+/[^/]+/[0-9a-f]{8}-[0-9a-f-]{27}/|/sec\d?\(|chunklist_w\d|(?<![\w-])eyJ[\w-]{8,}\.eyJ",
     re.IGNORECASE,
 )
 # 2. A stream row's notes saying its URL is bound to the requester or expires.
@@ -154,8 +160,10 @@ class Verdict(NamedTuple):
     copy_only: bool = False  # private only because of this copy's source or cells (module docstring)
 
 
-# The two orders of the four verdict classes; they differ only in where public stands. Across copies (merge) a clean
-# public copy beats a fault of one other copy only; within one copy (stricter) any fault beats public.
+# The two orders of the four verdict classes, lowest first; they differ only in where public stands. Across copies
+# (merge) a clean public copy beats a fault of one other copy only; within one copy (stricter) any fault beats public.
+# "private" is private for the stream itself (its URL, DRM, minted notes, the allowlist), "private-copy" for this copy
+# only (its source or its cells).
 MERGE_ORDER = ("private-copy", "public", "private", "nsfw")
 FAULT_ORDER = ("public", "private-copy", "private", "nsfw")
 
@@ -165,7 +173,7 @@ def _class(verdict: Verdict) -> str:
 
 
 def rank(verdict: Verdict) -> int:
-    """Merge rank, highest wins: nsfw > private for the stream itself > public > private for one copy only."""
+    """Merge rank, highest wins (MERGE_ORDER)."""
     return MERGE_ORDER.index(_class(verdict))
 
 
@@ -229,7 +237,7 @@ def url_rejection(url: str) -> tuple[str, str] | None:
 
 
 @functools.lru_cache(maxsize=1 << 18)
-def _token_shaped(text: str) -> bool:
+def token_shaped(text: str) -> bool:
     """TOKEN_URL in the text or its percent-decoded layers (an encoded &apikey%3D is still a key)."""
     return any(TOKEN_URL.search(layer.decode("utf-8", "replace")) for layer in egress.layers(text))
 
@@ -264,13 +272,21 @@ def _static_source(row: Mapping[str, str]) -> bool:
 
 
 def has_parameters(url: str) -> bool:
-    """Whether the URL carries parameters (D15): a non-empty query, or ";" or "?" in its path or a percent-decoded
-    layer of it. A fragment is never sent to the server and stays (TOKEN_URL still reads it)."""
+    """Whether the URL carries parameters (D15): a non-empty query, or ";", "?" or a Kodi "|" suffix in its path or a
+    percent-decoded layer of it. A fragment is never sent to the server and stays (TOKEN_URL reads its keys)."""
     try:
         parts = urlsplit(url)
     except ValueError:
         return True
-    return bool(parts.query) or any(mark in layer for layer in egress.layers(parts.path) for mark in (b";", b"?"))
+    return bool(parts.query) or any(mark in layer for layer in egress.layers(parts.path)
+                                    for mark in (b";", b"?", b"|"))
+
+
+def _path(url: str) -> str:
+    try:
+        return urlsplit(url).path
+    except ValueError:
+        return url
 
 
 def _listed_source(source: str) -> str | None:
@@ -291,13 +307,14 @@ def verdict(row: Mapping[str, str], allow: Allowlist) -> Verdict:
     if rejected:
         return Verdict(*rejected)
     stream = row["kind"] not in LIST_KINDS
-    # DRM is a property of the stream itself; for a list endpoint the notes describe its contents.
-    if stream and (DRM.search(row["format"]) or DRM.search(NOT_DRM.sub("", row["name"]))
-                   or DRM.search(NOT_DRM.sub("", row["notes"]))):
-        return Verdict("private", "drm")
     # iptv-org published this exact string, so it was not minted for our fetches alone.
     listed_by_iptv_org = url in allow.urls
-    if not listed_by_iptv_org and (_token_shaped(url) or (stream and MINTED_NOTES.search(row["notes"]))):
+    # DRM is a property of the stream itself; for a list endpoint the notes describe its contents.
+    if stream and (DRM.search(row["format"]) or DRM.search(NOT_DRM.sub("", row["name"]))
+                   or DRM.search(NOT_DRM.sub("", row["notes"]))
+                   or (not listed_by_iptv_org and DRM_PATH.search(_path(url)))):
+        return Verdict("private", "drm")
+    if not listed_by_iptv_org and (token_shaped(url) or (stream and MINTED_NOTES.search(row["notes"]))):
         return Verdict("private", "minted")
     listed = _listed_source(row["source_page"])
     if listed:
@@ -310,7 +327,7 @@ def verdict(row: Mapping[str, str], allow: Allowlist) -> Verdict:
     for column in columns:
         if _hidden_credential(row.get(column, "-")):
             return Verdict("private", "credential", copy_only=True)
-        if _token_shaped(row.get(column, "-")):
+        if token_shaped(row.get(column, "-")):
             return Verdict("private", "minted", copy_only=True)
     if stream and not listed_by_iptv_org and not _static_source(row):
         return Verdict("private", "minted", copy_only=True)
@@ -332,8 +349,8 @@ def _severity(verdict: Verdict) -> int:
 
 
 def stricter(first: Verdict | None, second: Verdict | None) -> Verdict | None:
-    """The stricter of two verdicts for one copy (None = no verdict). Within one copy any fault counts (nsfw > private
-    for the stream > private for this copy > public); across copies merge() ranks instead."""
+    """The stricter of two verdicts for one copy (None = no verdict), by FAULT_ORDER; across copies merge() ranks
+    instead."""
     if first is None or (second is not None and _severity(second) > _severity(first)):
         return second
     return first

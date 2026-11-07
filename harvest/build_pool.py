@@ -4,15 +4,15 @@
 Usage: build_pool.py <public-repo> <private-repo>
 
 Inputs, in merge order: iptv-org's streams.json; the i.mjh.nz FAST indexes (lists.FAST_INDEXES); the research
-seeds' stream rows (<public>/seed/research-streams.tsv, <private>/seed/research-private.tsv and research-nsfw.tsv);
-every research list endpoint that is a list file (lists.list_target), fetched now. Every copy is bucketed by
-rules.verdict (a row of a list the research put in nsfw, or private as a listed pirate list, and a research stream
-row citing such a list, also carries that list's verdict: lists.list_taints), copies are merged by exact URL
-(rules.merge), then each row gets its channel key and the iptv-org
-blocklist/NSFW joins (channels.py). Fetching iptv-org's API (streams, channels, blocklist) or a FAST index failing
-fails the run (exit 1); a research list failing is recorded in pulls.tsv. Before anything is written every public
-row is checked for this machine's egress IP (egress.py); a hit or a failed lookup fails the run and nothing is
-written. Outputs (plain TSV, values verbatim):
+seeds' stream rows (<private>/seed/research-{public,private,nsfw}.tsv, extract_research.py); every research list
+endpoint that is a list file (lists.list_target), fetched now. Every copy is bucketed by rules.verdict (a row of a
+list the research put in nsfw, or private as a listed pirate list, and a research stream row citing such a list,
+also carries that list's verdict: lists.list_taints), copies are merged by exact URL (rules.merge), then each row
+gets its channel key and the iptv-org blocklist/NSFW joins (channels.py). streams.tsv is the only public output
+(D16). Fetching iptv-org's API (streams, channels, blocklist) or a FAST index failing fails the run (exit 1); a
+research list failing is recorded in pulls.tsv. Before anything is written every public row is checked for this
+machine's egress IP (egress.py); a hit or a failed lookup fails the run and nothing is written. Outputs (plain TSV,
+values verbatim):
   <public>/pool/streams.tsv     public candidate streams (extract_research.OUT_COLUMNS + channel)
   <private>/pool/private.tsv    private rows with their reason
   <private>/pool/nsfw.tsv       NSFW rows
@@ -90,11 +90,10 @@ def pull_lists(research_lists: list[dict], taints: dict[str, Verdict | None]) \
     return [record for record, _ in results], pulled
 
 
-def research_seeds(public: Path, private: Path) -> list[dict[str, str]]:
+def research_seeds(private: Path) -> list[dict[str, str]]:
     """Every research seed row, its bucket (the file it is in) under "_bucket"."""
-    files = [(public / "seed" / "research-streams.tsv", "public"), (public / "seed" / "research-sources.tsv", "public"),
-             (private / "seed" / "research-private.tsv", "private"), (private / "seed" / "research-nsfw.tsv", "nsfw")]
-    return [{**row, "_bucket": name} for path, name in files for row in read_tsv(path)]
+    return [{**row, "_bucket": name} for name in ("public", "private", "nsfw")
+            for row in read_tsv(private / "seed" / f"research-{name}.tsv")]
 
 
 def seen_in(origins: str) -> str:
@@ -122,7 +121,7 @@ def main() -> int:
         print(f"required source failed: {error}", file=sys.stderr)
         return 1
     allow = Allowlist(iptv_org, parse_reviewed(REVIEWED_HOSTS.read_text(encoding="utf-8")), vouches)
-    seeds = research_seeds(args.public, args.private)
+    seeds = research_seeds(args.private)
     research_lists = [row for row in seeds if row["kind"] in LIST_KINDS]
     taints = lists.list_taints(research_lists)
     pulls, pulled = pull_lists(research_lists, taints)
@@ -135,8 +134,7 @@ def main() -> int:
             yield from tagged(rows, f"fast:{service}")
         for row in seeds:
             if row["kind"] not in LIST_KINDS:
-                yield from tagged([{c: row[c] for c in COLUMNS}], "research",
-                                  taints.get(lists.list_url(row["source_page"])))
+                yield from tagged([{c: row[c] for c in COLUMNS}], "research", lists.cited_taint(taints, row))
         for number, (rows, taint) in enumerate(pulled):
             yield from tagged(rows, f"list:{number}", taint)
 
