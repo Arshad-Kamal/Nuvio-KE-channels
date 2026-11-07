@@ -46,11 +46,12 @@ def seed_path(private: Path, bucket: str) -> Path:
 
 
 def private_repo(text: str) -> Path:
-    """The private repo argument; the public checkout (it holds harvest/) is refused: private rows written there would
-    be one commit from publication (swapped or old-style arguments)."""
+    """The private repo argument; the public checkout (it holds harvest/) and any directory inside it are refused:
+    private rows written there would be one commit from publication (swapped or old-style arguments)."""
     path = Path(text)
-    if (path / "harvest").exists():
-        raise argparse.ArgumentTypeError(f"{path} holds harvest/: that is the public repo, not the private one")
+    resolved = path.resolve()
+    if any((d / "harvest").is_dir() for d in (resolved, *resolved.parents)):
+        raise argparse.ArgumentTypeError(f"{path} is in a checkout holding harvest/: the public repo, not the private one")
     return path
 
 

@@ -62,11 +62,12 @@ class M3uTest(unittest.TestCase):
         self.assertNotIn("\t", rows[0]["name"])
         self.assertLessEqual(len(rows[0]["name"]), lists.MAX_NAME)
 
-    def test_state_does_not_leak_to_the_next_entry_and_images_are_skipped(self):
+    def test_a_second_url_gets_no_name_tvg_id_or_directives_and_images_are_skipped(self):
         rows = self.parse('#EXTINF:-1 tvg-id="A.us",A\n#EXTVLCOPT:http-user-agent=UA\nhttps://a.example/a.m3u8\n'
                           "https://b.example/b.m3u8\n#EXTINF:-1,Logo\nhttps://img.example/logo.png\n")
-        self.assertEqual([(r["url"], r["tvg_id"], r["headers"]) for r in rows],
-                         [("https://a.example/a.m3u8", "A.us", '{"User-Agent":"UA"}'), ("https://b.example/b.m3u8", "", "-")])
+        self.assertEqual([(r["url"], r["name"], r["tvg_id"], r["headers"]) for r in rows],
+                         [("https://a.example/a.m3u8", "A", "A.us", '{"User-Agent":"UA"}'),
+                          ("https://b.example/b.m3u8", "-", "", "-")])  # run 15: backups of unrelated channels
 
 
 class JsonListTest(unittest.TestCase):
@@ -224,6 +225,7 @@ class MergeRankTest(unittest.TestCase):
         row = merged(copy(url, "https://broadcaster.example/watch", notes="seen live"),
                      copy(url, notes="player uses ?token=abc"), copy(url, notes="clean"))[url]
         self.assertEqual((row["_bucket"], row["notes"], row["seen_in"]), ("public", "clean", "o0,o1,o2"))
+        self.assertEqual(merged(copy(url, name="A"), copy(url, name="-"), copy(url, name="B"))[url]["_names"], ["A", "B"])
 
     def test_a_verdict_about_the_stream_wins_over_a_public_copy(self):
         url = "https://iptv.example/a.m3u8"
@@ -341,6 +343,8 @@ class ListsTest(unittest.TestCase):
         for line in ("#EXTINF:" + "a" * 200_000, "#EXTINF:-1 " + "tvg-a " * 40_000 + ",N",
                      '#EXTINF:-1 a="' + "x" * 200_000, "#EXTINF:-1 " + "a=" * 100_000 + ",N"):
             list(lists.parse_m3u(line + "\nhttps://a.example/a\n", SOURCE))
+        for line in ("#EXTINF:-1 " + "a" * 100_000 + ",N", "#EXTINF:-1 " + "a:/" * 30_000 + ",N"):  # URL_IN_TEXT
+            list(lists.parse_m3u(line + "\nhttps://a.example/a\n", SOURCE))
         for text in ("http://h/?" + ";" * 1300 + "=" + ":" * 2700 + "x", "http://h/?" + ";a" * 2000 + "=1",
                      "http://h/a?" + "?" * 100_000 + "=1", "http://h/a?k=" + "eyJ" * 33_000,
                      "http://h/a?" + "token" * 20_000 + ".=1", "http://h/a?k=" + ".eyJ" * 25_000,
@@ -400,6 +404,27 @@ class ListsTest(unittest.TestCase):
         rows += lists.parse_json_list({"group": "XXX", "sections": [middle]}, SOURCE)
         self.assertEqual([verdict(r, ALLOW).bucket for r in rows], ["nsfw", "nsfw"])
         self.assertTrue(all(len(r["category"]) <= lists.MAX_NAME for r in rows))
+
+    def test_json_nsfw_signals_beyond_name_and_category(self):
+        data = {"groups": [
+            {"name": "XXX Channels", "channels": [{"name": "Ch 1", "url": "https://cdn.example.org/1.m3u8"}]},
+            {"name": "Ch 2", "description": "Hustler late night", "url": "https://cdn.example.org/2.m3u8"},
+            {"name": "Ch 3", "is_adult": True, "url": "https://cdn.example.org/3.m3u8"},
+            {"name": "Ch 4", "channel": "CNN.us", "nsfw": False, "logo": "https://i.example/7IxXX6f.png",
+             "youtube": "UCXXxRHhOXI6xFu8kDwV5UnQ", "url": "https://cdn.example.org/4.m3u8"}]}  # run 15 id
+        rows = list(lists.parse_json_list(data, SOURCE))
+        self.assertEqual([verdict(r, ALLOW).bucket for r in rows], ["nsfw", "nsfw", "nsfw", "public"])
+        self.assertEqual(rows[3]["tvg_id"], "CNN.us")
+
+    def test_german_and_french_erotic_names(self):
+        for name in ("Erotik Kanal", "Cin\u00e9 \u00e9rotique", "Canal Er\u00f3tico"):
+            self.assertEqual(verdict(copy("https://cdn.example.org/live/c.m3u8", name=name), ALLOW).bucket, "nsfw", name)
+
+    def test_pluto_de_adult_group_is_nsfw(self):
+        index = {"regions": {"de": {"channels": {PLUTO_ID: {"name": "Pluto TV Stimulierende Dokus",
+                                                            "group": "Sinnliche Fantasien"}}}}}
+        row = next(lists.fast_rows("pluto", index))
+        self.assertEqual(verdict(row, ALLOW).bucket, "nsfw")
 
     def test_a_json_drm_key_marks_its_own_urls_only(self):
         # run 12 shapes: teleonline's root "license" is its content licence; Zappr's clearkey channel has a non-DRM
@@ -505,6 +530,10 @@ class PathTokenTest(unittest.TestCase):
                     "https://cdn.example.org/live/c.m3u8#token=ab12",  # a fragment key
                     webcaster, "https://cdn.example.org/live/69393EAE6ADBC65A68F942022362A202/13.m3u8",
                     "https://cdn.example.org/tok_eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjF9.c2ln/live/a.m3u8"):  # a glued JWT
+            self.assertEqual(verdict(copy(url), ALLOW), rules.Verdict("private", "minted"), url)
+        for url in ("https://cdn.example.org/e64d564b9275484f85981d8c146fb915/us-east-1/5994000126001/profile_1/"
+                    "976f34cf5a614518b7b539cbf9812080/chunklist_ssaiV.m3u8",  # a Brightcove SSAI session
+                    "https://cdn.example.org/9bb0f4edcb8946e79f5017ddca6c02b0/" + "26af5488" * 8 + ".m3u8"):
             self.assertEqual(verdict(copy(url), ALLOW), rules.Verdict("private", "minted"), url)
         self.assertEqual(verdict(copy("https://cdn.example.org/live/c.m3u8#t=0.1"), ALLOW).bucket, "public")
         listed = Allowlist([webcaster], parse_reviewed(""), vouches)
@@ -636,6 +665,16 @@ class ChannelsTest(unittest.TestCase):
         row = pool_row("https://other.example/t.m3u8")
         join.apply(row, ["Tab.us"])
         self.assertEqual((row["country"], row["category"], row["_bucket"]), ("U S", "news xxx", "nsfw"))
+
+    def test_any_copy_name_alt_names_blocklist_nsfw_and_an_empty_key(self):
+        join = Channels(STREAMS, CHANNELS + [
+            {"id": "Hidden.us", "name": "Hidden", "alt_names": ["Night Owl TV"], "country": "US"},
+            {"id": "Tagged.us", "name": "Tagged Late", "country": "US", "categories": ["xxx"]}],
+            BLOCKLIST + [{"channel": "Hidden.us", "reason": "nsfw"}])
+        for name, names in (("Neutral", ["Neutral", "Night Owl TV"]), ("Tagged Late HD", [])):
+            row = pool_row("https://other.example/q.m3u8", name=name)  # no key: empty
+            join.apply(row, [], names)
+            self.assertEqual((row["channel"], row["_bucket"]), ("", "nsfw"), name)
 
     def test_an_unidentified_row_named_like_an_nsfw_channel_is_nsfw(self):
         # D19 audit (run 13): Pluto DE erotic channels whose provider ids iptv-org maps to nothing
@@ -775,13 +814,14 @@ class BuildPoolTest(unittest.TestCase):
         self.assertEqual(self.run_main(remote, self.seeds()), (1, {}))
         self.assertEqual(self.run_main(self.remote(streams={"not": "a list"}), self.seeds()), (1, {}))
 
-    def test_swapped_repos_are_refused_before_anything_runs(self):
+    def test_swapped_repos_and_a_private_dir_inside_the_public_checkout_are_refused(self):
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "pub" / "harvest").mkdir(parents=True)
-            with mock.patch.object(build_pool, "fetch_required", side_effect=AssertionError("ran")), \
-                    mock.patch.object(sys, "argv", ["x", str(Path(d) / "priv"), str(Path(d) / "pub")]), \
-                    redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                build_pool.main()
+            for private in (Path(d) / "pub", Path(d) / "pub" / "pool"):
+                with mock.patch.object(build_pool, "fetch_required", side_effect=AssertionError("ran")), \
+                        mock.patch.object(sys, "argv", ["x", str(Path(d) / "priv"), str(private)]), \
+                        redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    build_pool.main()
 
     def test_the_egress_ip_in_a_public_row_fails_before_writing(self):
         url = "https://iptv.example/live/3405803783/a.m3u8"

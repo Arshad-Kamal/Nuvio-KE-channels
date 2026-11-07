@@ -6,7 +6,7 @@ order after the exact URL: the iptv-org channel[@feed] of the exact URL; the ipt
 when only one does, else "<service>:<id>"); a tvg-id naming a channels.json id; a name + 2-letter country naming
 exactly one channels.json channel; else empty. A row whose channel key or tvg-id names a channel iptv-org blocklists
 or marks NSFW moves bucket; so does a row whose key names no channels.json channel (empty, "<service>:<id>") and
-whose name is an NSFW channel's name or alt name in any country (Spec 60 D19 audit: iptv-org lists no stream for
+whose name (any copy's) is an NSFW channel's name or alt name in any country (Spec 60 D19 audit: iptv-org lists no stream for
 Pluto DE's erotic channels, so their provider ids map to nothing). Every value taken from iptv-org's files is cleaned
 with lists.cell before it is published.
 """
@@ -63,6 +63,17 @@ def name_key(name: str) -> str:
     return " ".join(re.findall(r"\w+", QUALITY.sub(" ", text)))
 
 
+def _names(info: dict) -> Iterable[str]:
+    """A channels.json channel's name and alt names, as name keys (empty ones skipped)."""
+    for name in [info.get("name")] + list(info.get("alt_names") or []):
+        if isinstance(name, str) and name_key(name):
+            yield name_key(name)
+
+
+def _to_nsfw(row: dict) -> None:
+    row["_bucket"], row["reason"] = "nsfw", "nsfw"
+
+
 def _unique(pairs: Iterable[tuple[object, str]]) -> dict:
     """key -> value for the keys that map to exactly one value."""
     found: dict[object, set[str]] = defaultdict(set)
@@ -81,15 +92,17 @@ class Channels:
         paths = [(_host_path(url), provider_id(url), channel) for url, channel, _ in listed]
         self.by_path = _unique((path, channel) for path, _, channel in paths if path)
         self.by_provider = _unique((provider, channel) for _, provider, channel in paths if provider)
-        self.by_name = _unique(((info["country"].upper(), name_key(name)), info["id"])
-                               for info in self.info.values() if isinstance(info.get("country"), str)
-                               for name in [info.get("name")] + list(info.get("alt_names") or [])
-                               if isinstance(name, str) and name_key(name))
+        self.by_name = _unique(((info["country"].upper(), name), info["id"]) for info in self.info.values()
+                               if isinstance(info.get("country"), str) for name in _names(info))
         self.blocked = {b["channel"].lower(): str(b.get("reason") or "listed") for b in blocklist
                         if isinstance(b, dict) and isinstance(b.get("channel"), str)}
-        self.nsfw_names = {name_key(name) for info in self.info.values() if info.get("is_nsfw") is True
-                           for name in [info.get("name")] + list(info.get("alt_names") or [])
-                           if isinstance(name, str) and name_key(name)}
+        self.nsfw_names = {name for info in self.info.values() if self._nsfw(info) for name in _names(info)}
+
+    def _nsfw(self, info: dict) -> bool:
+        """Whether iptv-org marks the channel NSFW: is_nsfw, an nsfw blocklist reason, or an NSFW category."""
+        categories = info.get("categories") if isinstance(info.get("categories"), list) else []
+        return (info.get("is_nsfw") is True or self.blocked.get(info["id"].lower()) == "nsfw"
+                or nsfw_category(";".join(str(c) for c in categories)))
 
     def key(self, row: dict, tvg_id: str) -> str:
         """The channel key of one pool row (module docstring)."""
@@ -110,29 +123,29 @@ class Channels:
         return cell(named.pop(), 100) if len(named) == 1 else ""
 
     def _flag(self, row: dict, info: dict) -> None:
-        """Moves the row when iptv-org blocklists the channel or marks it NSFW."""
+        """Moves the row when iptv-org blocklists the channel or marks it NSFW (_nsfw)."""
         blocked = self.blocked.get(info["id"].lower())
-        if (blocked == "nsfw" or info.get("is_nsfw") is True) and row["_bucket"] != "nsfw":
-            row["_bucket"], row["reason"] = "nsfw", "nsfw"
+        if self._nsfw(info):
+            if row["_bucket"] != "nsfw":
+                _to_nsfw(row)
         elif blocked and row["_bucket"] == "public":
             row["_bucket"], row["reason"] = "private", cell(f"blocklist:{blocked}")
 
-    def apply(self, row: dict, tvg_ids: list[str]) -> None:
+    def apply(self, row: dict, tvg_ids: list[str], names: Iterable[str] = ()) -> None:
         """Sets row["channel"] (keyed by the first copy's tvg-id that names a channels.json id); a blocklisted or NSFW
-        channel, named by the key or by any copy's tvg-id, moves the row out of public (NSFW out of private too); empty
-        country and category cells are filled from channels.json."""
+        channel, named by the key or by any copy's tvg-id, moves the row out of public (NSFW out of private too); a row
+        whose key names no channels.json channel moves to nsfw when its name or any copy's name (names) is an NSFW
+        channel's name or alt name; empty country and category cells are filled from channels.json."""
         row["channel"] = self.key(row, next((t for t in tvg_ids if self.info.get(t.split("@")[0].lower())), ""))
         named = [self.info.get(k.split("@")[0].lower()) for k in [row["channel"], *tvg_ids]]
         for info in filter(None, named):
             self._flag(row, info)
         info = named[0]
         if info is None:
-            if name_key(row["name"]) in self.nsfw_names and row["_bucket"] != "nsfw":
-                row["_bucket"], row["reason"] = "nsfw", "nsfw"
+            if row["_bucket"] != "nsfw" and any(name_key(n) in self.nsfw_names for n in [row["name"], *names]):
+                _to_nsfw(row)
             return
         if row["country"] in ("", "-") and isinstance(info.get("country"), str):
             row["country"] = cell(info["country"])
         if row["category"] in ("", "-") and isinstance(info.get("categories"), list):
-            row["category"] = cell(";".join(str(c) for c in info["categories"]))
-            if nsfw_category(row["category"]) and row["_bucket"] != "nsfw":
-                row["_bucket"], row["reason"] = "nsfw", "nsfw"
+            row["category"] = cell(";".join(str(c) for c in info["categories"]))  # NSFW ones moved by _flag

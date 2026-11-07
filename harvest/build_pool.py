@@ -141,7 +141,7 @@ def main() -> int:
     kept = merge(copies())
     joined = Channels(streams, *joins)
     for row in kept.values():
-        joined.apply(row, row["_tvg_ids"])
+        joined.apply(row, row["_tvg_ids"], row["_names"])
         row["seen_in"] = seen_in(row["seen_in"])
 
     def pick(name: str) -> list[dict]:

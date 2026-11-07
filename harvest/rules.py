@@ -83,16 +83,20 @@ _HOST_PATTERNS = tuple(_host_pattern(h) for h in PRIVATE_HOSTS)
 
 # NSFW by URL, name or category. "adult" alone is not used: Adult Swim is a cartoon channel.
 NSFW_URL = re.compile(
-    r"\bxxx\b|/xxx\.m3u|categories/xxx|porn|erotic|\bspicy\b|playboy|hustler|brazzers|visit-x|redlight|"
+    r"\bxxx\b|/xxx\.m3u|categories/xxx|porn|er[o\u00f3]tic|erotik|[e\u00e9]rotique|\bspicy\b|playboy|hustler|brazzers|"
+    r"visit-x|redlight|"
     r"\bnsfw\b|drsof1968",
     re.IGNORECASE,
 )
-NSFW_NAME = re.compile(
-    r"xxx|porn|erotic|\bspicy\b|playboy|hustler|brazzers|visit-x|redlight|\bnsfw\b|dorcel|penthouse|"
-    r"vivid ?tv|babes ?tv|babestation|18\+",
-    re.IGNORECASE,
-)
-NSFW_CATEGORIES = {"xxx", "adult", "erotic", "nsfw"}
+_NSFW_TERMS = (r"porn|er[o\u00f3]tic|erotik|[e\u00e9]rotique|\bspicy\b|playboy|hustler|brazzers|visit-x|redlight|\bnsfw\b|"
+               r"dorcel|penthouse|vivid ?tv|babes ?tv|babestation|18\+")
+NSFW_NAME = re.compile(r"xxx|" + _NSFW_TERMS, re.IGNORECASE)
+# The same terms in an entry's other text (attribute values, JSON fields), where random ids live (a YouTube channel
+# "UCXXxRH...", an imgur "7IxXX6f"): there "xxx" must start a word.
+NSFW_TEXT = re.compile(r"(?<![a-z0-9])xxx|" + _NSFW_TERMS, re.IGNORECASE)
+# Whole category tokens. "sinnliche fantasien" is Pluto DE's adult group: all 8 of its channels are erotic by Pluto's own
+# descriptions (Spec 60 D19 audit, review round 6); iptv-org flags only 4 of them.
+NSFW_CATEGORIES = {"xxx", "adult", "erotic", "nsfw", "sinnliche fantasien"}
 ADULT_WORD = re.compile(r"\badult\b(?!\s*swim)", re.IGNORECASE)  # free-text group-titles ("Adult Channels")
 
 DRM_SCHEMES = r"widevine|clearkey|playready|fairplay"
@@ -130,12 +134,13 @@ _IP_VALUE = (r"[?&;][^=&#;?]*=(?:(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?|\[?(?:(?:[0-9a
              r"(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,6})?::(?:[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){0,6})?)\]?)(?![\w.:-])")
 # Path-token markers (/token/, CloudFront's /_token/v1.<epoch>.<hmac>/), a path segment of base64 JSON
 # (Rakuten/MediaTailor bitok/eyJ<session>), /expires/<epoch>, DAI pod-serving (/stream/<uuid>) and MediaTailor session
-# paths, Dailymotion sec(...) paths, Wowza session chunklists.
+# paths, Dailymotion sec(...) paths, Wowza session chunklists, Brightcove SSAI session paths (/profile_<n>/<32hex>/).
 _PATH_MARKERS = (r"/[_-]?(?:token|tkn|session|signature)/|/eyJ[\w-]{8,}|/expires?/\d|/stream/[0-9a-f]{8}-[0-9a-f-]{27}|"
-                 r"/v1/manifest/[^/]+/[^/]+/[0-9a-f]{8}-[0-9a-f-]{27}/|/sec\d?\(|chunklist_w\d")
-# A hex digest segment, then a number (webcaster.pro free_<hash>/<id>/1080p/<md5>/<expiry>.m3u8; key-bound restreams
-# /live/<32hex>/<channel>.m3u8). Measured 2026-11-07 (run 11): 3 public non-exact rows, all webcaster.pro.
-_SIGNED_PATH = r"/[0-9a-f]{32}/\d++(?=[./]|$)"
+                 r"/v1/manifest/[^/]+/[^/]+/[0-9a-f]{8}-[0-9a-f-]{27}/|/sec\d?\(|chunklist_w\d|/profile_\d+/[0-9a-f]{32}/")
+# A hex digest segment, then a number or a sha256 (webcaster.pro free_<hash>/<id>/1080p/<md5>/<expiry>.m3u8; key-bound
+# restreams /live/<32hex>/<channel>.m3u8; interactvty.pro /<32hex>/<64hex>.m3u8, a different hash per list for one
+# stream). Measured 2026-11-07: 3 + 1 public non-exact rows.
+_SIGNED_PATH = r"/[0-9a-f]{32}/(?:\d++|[0-9a-f]{64})(?=[./]|$)"
 # A JWT anywhere, by its payload ("tok_eyJ<header>.eyJ<payload>" too): "." is not in the run, so linear.
 _JWT = r"\.eyJ[\w-]{8,}"
 TOKEN_URL = re.compile("|".join((_SIGNED_PAIR, _IP_VALUE, _PATH_MARKERS, _SIGNED_PATH, _JWT)), re.IGNORECASE)
@@ -296,7 +301,7 @@ def _static_source(row: Mapping[str, str]) -> bool:
     return has_suffix(host, STATIC_SOURCES) and not REDIRECT_PATH.match(path)
 
 
-def _split(url: str) -> SplitResult | None:
+def _urlsplit_or_none(url: str) -> SplitResult | None:
     """urlsplit's parts, None when it cannot read the URL (an unbalanced "[")."""
     try:
         return urlsplit(url)
@@ -307,7 +312,7 @@ def _split(url: str) -> SplitResult | None:
 def has_parameters(url: str) -> bool:
     """Whether the URL carries parameters (D15): a non-empty query, or ";", "?" or a Kodi "|" suffix in its path or a
     percent-decoded layer of it. A fragment is never sent to the server and stays (token_shaped reads its keys)."""
-    parts = _split(url)
+    parts = _urlsplit_or_none(url)
     return parts is None or bool(parts.query) or any(mark in layer for layer in egress.layers(parts.path)
                                                      for mark in (b";", b"?", b"|"))
 
@@ -333,7 +338,7 @@ def verdict(row: Mapping[str, str], allow: Allowlist) -> Verdict:
     # iptv-org published this exact string, so it was not minted for our fetches alone.
     listed_by_iptv_org = url in allow.urls
     # DRM is a property of the stream itself; for a list endpoint the notes describe its contents.
-    parts = _split(url)
+    parts = _urlsplit_or_none(url)
     if stream and (DRM.search(row["format"]) or DRM.search(NOT_DRM.sub("", row["name"]))
                    or DRM.search(NOT_DRM.sub("", row["notes"]))
                    or (not listed_by_iptv_org and DRM_PATH.search(parts.path if parts else url))):
@@ -382,11 +387,12 @@ def stricter(first: Verdict | None, second: Verdict | None) -> Verdict | None:
 
 def merge(copies: Iterable[tuple[Mapping[str, str], str, Verdict]]) -> dict[str, dict]:
     """Dedupes (row, origin, verdict) copies by exact URL. The highest-ranked verdict wins (rank()) and its copy's cells
-    are kept; the first copy wins a tie. seen_in lists every distinct origin, first seen first; _tvg_ids lists every
-    distinct non-empty tvg_id of any copy, first seen first."""
+    are kept; the first copy wins a tie. seen_in lists every distinct origin, first seen first; _tvg_ids and _names list
+    every distinct non-empty tvg_id and name of any copy, first seen first (channels.Channels.apply judges them all)."""
     kept: dict[str, dict] = {}
     seen: dict[str, dict[str, None]] = {}
     tvg_ids: dict[str, dict[str, None]] = {}
+    names: dict[str, dict[str, None]] = {}
     for row, where, found in copies:
         url = row["url"]
         old = kept.get(url)
@@ -395,7 +401,10 @@ def merge(copies: Iterable[tuple[Mapping[str, str], str, Verdict]]) -> dict[str,
         seen.setdefault(url, {})[where] = None
         if row.get("tvg_id"):
             tvg_ids.setdefault(url, {})[row["tvg_id"]] = None
+        if row.get("name", "-") != "-":
+            names.setdefault(url, {})[row["name"]] = None
     for url, row in kept.items():
         row["seen_in"] = ",".join(seen[url])
         row["_tvg_ids"] = list(tvg_ids.get(url, {}))
+        row["_names"] = list(names.get(url, {}))
     return kept

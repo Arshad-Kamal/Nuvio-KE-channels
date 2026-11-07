@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from allowlist import IPTV_ORG_API, IPTV_ORG_STREAMS, MAX_DOWNLOAD, has_suffix
-from rules import (DRM, LIST_KINDS, M3U_FILE, NSFW_NAME, STATIC_SOURCES, Verdict, hidden_credential, nsfw_category,
+from rules import (DRM, LIST_KINDS, M3U_FILE, NSFW_TEXT, STATIC_SOURCES, Verdict, hidden_credential, nsfw_category,
                    stricter, token_shaped)
 
 MAX_GUNZIPPED = MAX_DOWNLOAD  # real lists are far smaller; 8 parallel fetches stay within a few hundred MB
@@ -54,6 +54,8 @@ JSON_NOT_STREAM_KEY = re.compile(r"logo|image|icon|thumb|poster|banner|fanart|^a
                                  re.IGNORECASE)
 JSON_NAME_KEYS = ("name", "title", "channel", "channel_name", "nombre", "nome")
 JSON_CATEGORY_KEYS = ("category", "categories", "group", "group_title", "group-title", "genre", "genres")
+JSON_TVG_ID_KEYS = ("tvg_id", "tvg-id", "channel")  # iptv-org API mirrors carry the channel id as "channel"
+JSON_ADULT_FLAG = re.compile(r"(?:is_?)?(?:nsfw|adult)", re.IGNORECASE)  # fullmatched against a key
 # The request headers kept, by the names lists use (EXTVLCOPT http-* options, Kodi "|Name=value" suffixes). Others
 # (Cookie, Authorization...) are dropped: they would publish a session.
 HEADER_NAMES = {"http-referrer": "Referer", "http-user-agent": "User-Agent", "http-origin": "Origin",
@@ -339,15 +341,15 @@ def _category(parts: Iterable[str | None], nsfw: bool = False) -> str:
 def parse_m3u(text: str, source: str) -> Iterator[dict[str, str]]:
     """Rows of an extended M3U playlist (#EXTINF + URL line). Directives may come before or after #EXTINF (Kodi lists
     put #KODIPROP first), so an entry's state is cleared only after its URL line. The category is group-title and
-    #EXTGRP. NSFW signals beyond the name and category cells: the name terms (NSFW_NAME) anywhere in the #EXTINF line
+    #EXTGRP. NSFW signals beyond the name and category cells: the name terms (NSFW_TEXT) anywhere in the #EXTINF line
     but its URLs (tvg-name, a name an unquoted attribute swallowed; a logo URL's random "7IxXX6f" is not a name), and
     the category rules on the leftover (_extinf). A URL line with no #EXTINF of its own (another URL of the entry
-    before) is unnamed but keeps that entry's NSFW signal."""
-    extinf, headers, drm, group, nsfw = "", [], False, "", False
+    before) keeps that entry's NSFW signal but not its name or tvg-id (run 15: lists put unrelated backups there)."""
+    extinf, fresh, headers, drm, group, nsfw = "", False, [], False, "", False
     for raw in text.splitlines():
         line = raw.strip().lstrip("\ufeff")
         if line.startswith("#EXTINF"):
-            extinf = line
+            extinf, fresh = line, True
         elif line.startswith("#EXTVLCOPT:"):
             option, _, value = line[len("#EXTVLCOPT:"):].partition("=")
             headers.append((option, value))
@@ -358,8 +360,10 @@ def parse_m3u(text: str, source: str) -> Iterator[dict[str, str]]:
         elif line and not line.startswith("#"):
             attributes, name, leftover = _extinf(extinf) if extinf else ({}, "", "")
             categories = (attributes.get("group-title"), group)
-            nsfw = ((nsfw and not extinf) or bool(NSFW_NAME.search(URL_IN_TEXT.sub(" ", extinf)))
-                    or nsfw_category(leftover) or nsfw_category("; ".join(filter(None, categories))))
+            own = (bool(NSFW_TEXT.search(URL_IN_TEXT.sub(" ", extinf))) or nsfw_category(leftover)
+                   or nsfw_category("; ".join(filter(None, categories))))
+            carried = nsfw and not fresh  # another URL of the entry before (its #EXTGRP is not repeated)
+            nsfw = own or carried
             found = _stream_url(line.split()[0])
             if found:
                 url, kodi_headers, kodi_drm = found
@@ -369,7 +373,8 @@ def parse_m3u(text: str, source: str) -> Iterator[dict[str, str]]:
                           headers=headers_cell(headers + kodi_headers),
                           notes="KODIPROP license (DRM)" if drm else "license pair (DRM)" if kodi_drm else "-",
                           tvg_id=attributes.get("tvg-id", ""))
-            extinf, headers, drm, group = "", [], False, ""
+            # nsfw stays for the entry's further URL lines (carried); everything else belongs to this URL.
+            extinf, fresh, headers, drm, group = "", False, [], False, ""
 
 
 def _json_category(node: dict) -> str | None:
@@ -386,10 +391,12 @@ def _json_category(node: dict) -> str | None:
 def parse_json_list(data: object, source: str) -> Iterator[dict[str, str]]:
     """Rows of a JSON list of any shape: string URLs under stream-like keys, named by the nearest name key; the category
     is the node's own, then its ancestors' (a group's "XXX" survives a child's "Movies" and reaches the NSFW rules),
-    capped (_category). A node with a license/DRM key, or a Kodi DRM pair on the URL, marks its own URLs DRM, not its
-    children's (a root "license" is the list's content licence; a clearkey channel's "fallback" is its non-DRM
-    variant); a site root is not a stream."""
-    stack = [(data, ("", "-"))]
+    capped (_category). As in M3U, the name terms (NSFW_TEXT) in any other text of the node (not a URL: a description,
+    an ancestor's name) and a true nsfw/adult flag are NSFW signals; they mark the node's category, so its children
+    carry them. The tvg-id is the nearest JSON_TVG_ID_KEYS string. A node with a license/DRM key, or a Kodi DRM pair
+    on the URL, marks its own URLs DRM, not its children's (a root "license" is the list's content licence; a clearkey
+    channel's "fallback" is its non-DRM variant); a site root is not a stream."""
+    stack = [(data, ("", "-", ""))]
     while stack:
         node, context = stack.pop()
         if isinstance(node, list):
@@ -398,7 +405,11 @@ def parse_json_list(data: object, source: str) -> Iterator[dict[str, str]]:
         if not isinstance(node, dict):
             continue
         name = next((node[k] for k in JSON_NAME_KEYS if isinstance(node.get(k), str)), context[0])
-        category = _category((_json_category(node), context[1]))
+        tvg_id = next((node[k] for k in JSON_TVG_ID_KEYS if isinstance(node.get(k), str)), context[2])
+        text = " ".join(v for v in node.values() if isinstance(v, str) and not URL_START.match(v.strip()))
+        nsfw = bool(NSFW_TEXT.search(text)) or any(
+            JSON_ADULT_FLAG.fullmatch(str(k)) and str(v).strip().lower() in ("true", "1", "yes") for k, v in node.items())
+        category = _category((_json_category(node), context[1]), nsfw)
         drm = any(_drm_key(key) for key in node)
         children = []
         for key, value in node.items():
@@ -408,9 +419,9 @@ def parse_json_list(data: object, source: str) -> Iterator[dict[str, str]]:
                 if (found and JSON_URL_KEY.search(key) and not JSON_NOT_STREAM_KEY.search(key)
                         and urlsplit(found[0]).path.strip("/")):
                     yield row(name, found[0], source, category=category, headers=headers_cell(found[1]),
-                              notes="license key (DRM)" if drm or found[2] else "-")
+                              notes="license key (DRM)" if drm or found[2] else "-", tvg_id=tvg_id)
             elif isinstance(value, (dict, list)):
-                children.append((value, (name, category)))
+                children.append((value, (name, category, tvg_id)))
         stack.extend(reversed(children))
 
 
