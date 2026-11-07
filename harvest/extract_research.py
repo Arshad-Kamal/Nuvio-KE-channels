@@ -12,7 +12,9 @@ list's verdict (lists.cited_taint, as in build_pool). Rows are deduplicated by e
 highest-ranked copy wins, a copy private only for its own source or cells yields to a public copy), and every report
 that recorded the URL is listed in seen_in. The allowlist (allowlist.py) is built from iptv-org's streams.json
 (downloaded unless --streams names a local copy) and reviewed-hosts.txt. The seeds are inputs to build_pool.py, which
-re-judges every row and alone publishes (D16: no seed file is public). Outputs (plain TSV, values verbatim):
+re-judges every row and alone publishes (D16: no seed file is public), so a private repo that is the public checkout
+(it holds harvest/) or a run directory without reports is refused before anything is read. Outputs (plain TSV, values
+verbatim):
   <private-repo>/seed/research-public.tsv     rows the rules would publish, every kind
   <private-repo>/seed/research-private.tsv    private bucket, every kind, with its reason
   <private-repo>/seed/research-nsfw.tsv       nsfw bucket, every kind
@@ -35,6 +37,29 @@ REPORT = re.compile(r"^\d\d-.*\.md$")
 URL_IN_LINE = re.compile(r"[a-z][a-z0-9+.-]*://", re.IGNORECASE)
 # R1 reports whose rows lost markdown escapes or percent-encoding during writing (R1 final report, parser notes).
 RECHECK = {"2026-11-06-162030": ("31-", "36-", "38-")}
+SEED_BUCKETS = ("public", "private", "nsfw")
+
+
+def seed_path(private: Path, bucket: str) -> Path:
+    """The seed file of one bucket in the private repo."""
+    return private / "seed" / f"research-{bucket}.tsv"
+
+
+def private_repo(text: str) -> Path:
+    """The private repo argument; the public checkout (it holds harvest/) is refused: private rows written there would
+    be one commit from publication (swapped or old-style arguments)."""
+    path = Path(text)
+    if (path / "harvest").exists():
+        raise argparse.ArgumentTypeError(f"{path} holds harvest/: that is the public repo, not the private one")
+    return path
+
+
+def research_run(text: str) -> Path:
+    """A research run directory argument: it must hold NN-*.md reports (a repo passed here would be skipped silently)."""
+    path = Path(text)
+    if not path.is_dir() or not any(REPORT.match(p.name) for p in path.iterdir()):
+        raise argparse.ArgumentTypeError(f"{path} is not a research run directory (no NN-*.md reports)")
+    return path
 
 
 def rows_of(run_dir: Path, skipped: list[str], empty: list[str]):
@@ -84,8 +109,8 @@ def write_all(outputs: dict[Path, str]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Extract the Spec 60 research tables into seed files.")
     parser.add_argument("--streams", type=Path, help="local copy of iptv-org's streams.json (default: download)")
-    parser.add_argument("private", type=Path)
-    parser.add_argument("runs", type=Path, nargs="+")
+    parser.add_argument("private", type=private_repo)
+    parser.add_argument("runs", type=research_run, nargs="+")
     args = parser.parse_args()
     skipped: list[str] = []
     empty: list[str] = []
@@ -104,14 +129,13 @@ def main() -> int:
     taints = lists.list_taints(merge(c for c in judged if c[0]["kind"] in LIST_KINDS).values())
     kept = merge((row, where, stricter(found, lists.cited_taint(taints, row))) for row, where, found in judged)
 
-    def pick(b: str) -> list[dict]:
-        return [{k: v for k, v in r.items() if not k.startswith("_")} for r in kept.values() if r["_bucket"] == b]
-
-    write_all({args.private / "seed" / f"research-{b}.tsv": tsv(pick(b)) for b in ("public", "private", "nsfw")})
+    seeds = {b: [{k: v for k, v in r.items() if not k.startswith("_")} for r in kept.values() if r["_bucket"] == b]
+             for b in SEED_BUCKETS}
+    write_all({seed_path(args.private, b): tsv(rows) for b, rows in seeds.items()})
     reasons = collections.Counter((r["_bucket"], r["reason"].split(":")[0]) for r in kept.values())
-    print(f"rows read {len(pairs)}, unique URLs {len(kept)}: public {len(pick('public'))}, private "
-          f"{len(pick('private'))}, nsfw {len(pick('nsfw'))}; skipped lines {len(skipped)}, reports without a table "
-          f"{len(empty)}")
+    print(f"rows read {len(pairs)}, unique URLs {len(kept)}: "
+          + ", ".join(f"{b} {len(rows)}" for b, rows in seeds.items())
+          + f"; skipped lines {len(skipped)}, reports without a table {len(empty)}")
     for (b, reason), count in sorted(reasons.items()):
         print(f"  {b} {reason or '-'}: {count}")
     return 0

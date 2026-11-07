@@ -8,7 +8,7 @@ lists them. A stream is published only when iptv-org lists it, its host already 
 ad-supported (FAST) service, or its host has been reviewed (`harvest/reviewed-hosts.txt`). Streams that need a
 subscriber login, adult channels, DRM streams, URLs made for one viewer (tokens, session links) unless iptv-org lists
 that exact URL, and hosts the research named as pay-channel restreams or proxies are not published. A URL with a query
-string (`?...`) or `;` parameters is published only when iptv-org lists that exact URL.
+string (`?...`), `;` parameters or a Kodi `|` suffix is published only when iptv-org lists that exact URL.
 
 ## Files
 

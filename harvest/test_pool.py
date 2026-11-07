@@ -282,8 +282,9 @@ class ListsTest(unittest.TestCase):
         self.assertEqual(lists.parse_list(lists.Fetched(SOURCE, SOURCE, media)), ("not-a-list", []))
         epg_named = "https://raw.githubusercontent.com/o/r/main/Italy_No_EPG.m3u"
         self.assertEqual(lists.list_target(research(epg_named, fmt="-")), (epg_named, "static"))
-        panel = "http://panel.example:8080/get.php?username=u&password=p&type=m3u"
-        self.assertEqual(lists.list_target(research(panel)), (None, "skip:credential"))
+        for panel in ("http://panel.example:8080/get.php?username=u&password=p&type=m3u",
+                      "http://xxx-panel.example:8080/get.php?username=u&password=p&type=m3u"):  # NSFW-named too
+            self.assertEqual(lists.list_target(research(panel)), (None, "skip:credential"), panel)
 
     def test_samsung_index_shapes(self):
         for index in ({"slug": "stvp-{id}\tx", "regions": {}}, {"slug": "stvp", "regions": {}}, ["not", "a", "dict"]):
@@ -341,34 +342,85 @@ class ListsTest(unittest.TestCase):
                      '#EXTINF:-1 a="' + "x" * 200_000, "#EXTINF:-1 " + "a=" * 100_000 + ",N"):
             list(lists.parse_m3u(line + "\nhttps://a.example/a\n", SOURCE))
         for text in ("http://h/?" + ";" * 1300 + "=" + ":" * 2700 + "x", "http://h/?" + ";a" * 2000 + "=1",
-                     "http://h/a?" + "?" * 4000 + "=1", "http://h/a?k=" + "eyJ" * 1300):
+                     "http://h/a?" + "?" * 100_000 + "=1", "http://h/a?k=" + "eyJ" * 33_000,
+                     "http://h/a?" + "token" * 20_000 + ".=1", "http://h/a?k=" + ".eyJ" * 25_000,
+                     "http://h/a/" + "0" * 32 + "/" + "1" * 100_000 + "x"):
             self.assertFalse(rules.token_shaped(text))
         self.assertFalse(rules._personal_jwt("eyJ" * 20_000))
+        self.assertFalse(rules._personal_jwt(".eyJ" * 25_000))
         list(lists.parse_m3u("#EXTINF:-1," + "tvg-a=x," * 25_000 + "N\nhttps://a.example/a\n", SOURCE))
         self.assertLess(time.monotonic() - started, 5)  # quadratic regexes took minutes here
 
-    def test_extinf_leftovers_and_bare_attributes_reach_the_nsfw_rules(self):
+    def test_every_text_of_an_extinf_entry_reaches_the_nsfw_rules(self):
         rows = list(lists.parse_m3u(
             '#EXTINF:-1 tvg-logo="https://l.example/a.png group-title="XXX",Ch 1\nhttps://cdn.example.org/1.m3u8\n'
             "#EXTINF:-1,group-title=Adult,Hot Night\nhttps://cdn.example.org/2.m3u8\n"
             "#EXTINF:-1 group-title=Adult\nhttps://cdn.example.org/3.m3u8\n"
-            "#EXTINF:-1 radio=true,Plain\nhttps://cdn.example.org/4.m3u8\n", SOURCE))
+            "#EXTINF:-1 radio=true,Plain\nhttps://cdn.example.org/4.m3u8\n"
+            "#EXTINF:-1,tvg-id=Brazzers.us Brazzers TV\nhttps://cdn.example.org/5.m3u8\n"  # the name swallowed
+            "#EXTINF:-1 tvg-id=x.us Hot XXX\nhttps://cdn.example.org/6.m3u8\n"
+            '#EXTINF:-1 group-title="Movies",Neutral\n#EXTGRP:XXX\nhttps://cdn.example.org/7.m3u8\n'
+            '#EXTINF:-1 tvg-name="Penthouse HD",Late\nhttps://cdn.example.org/8.m3u8\n'
+            "https://cdn.example.org/9.m3u8\n"  # a second URL of the entry before
+            "#EXTINF:-1,Next\nhttps://cdn.example.org/10.m3u8\nhttps://cdn.example.org/11.m3u8\n", SOURCE))
         self.assertEqual([(r["name"], r["category"]) for r in rows],
-                         [("Ch 1", "XXX"), ("Hot Night", "Adult"), ("-", "Adult"), ("Plain", "-")])
-        self.assertEqual([verdict(r, ALLOW).bucket for r in rows], ["nsfw", "nsfw", "nsfw", "public"])
+                         [("Ch 1", "nsfw"), ("Hot Night", "Adult"), ("-", "Adult"), ("Plain", "-"), ("-", "nsfw"),
+                          ("-", "nsfw"), ("Neutral", "Movies; XXX"), ("Late", "nsfw"), ("-", "nsfw"), ("Next", "-"),
+                          ("-", "-")])
+        self.assertEqual([verdict(r, ALLOW).bucket for r in rows],
+                         ["nsfw", "nsfw", "nsfw", "public", "nsfw", "nsfw", "nsfw", "nsfw", "nsfw", "public", "public"])
 
-    def test_json_categories_accumulate_from_ancestors(self):
-        data = {"group": "XXX", "channels": [{"name": "N", "genre": "Movies", "url": "https://cdn.example.org/n.m3u8"}]}
-        rows = list(lists.parse_json_list(data, SOURCE))
-        self.assertEqual(rows[0]["category"], "XXX; Movies")
+    def test_a_long_group_title_does_not_cut_an_nsfw_signal(self):
+        long = "; ".join(f"Genre {n}" for n in range(40))
+        rows = list(lists.parse_m3u(f'#EXTINF:-1 group-title="{long}",N\n#EXTGRP:XXX\nhttps://cdn.example.org/1.m3u8\n',
+                                    SOURCE))
         self.assertEqual(verdict(rows[0], ALLOW).bucket, "nsfw")
+        self.assertTrue(rows[0]["category"].startswith("nsfw; Genre 0"))
 
-    def test_json_lists_carry_the_nearest_category(self):
-        data = {"groups": [{"group": "XXX Movies", "channels": [{"name": "Neutral", "url": "https://cdn.example.org/n.m3u8"}]},
+    def test_leading_comma_bare_values_lose_their_separating_comma(self):
+        rows = list(lists.parse_m3u("#EXTINF:-1,tvg-id=CNN.us,tvg-country=US,group-title=News,CNN\n"
+                                    "https://x.example/x.m3u8\n", SOURCE))
+        self.assertEqual((rows[0]["name"], rows[0]["tvg_id"], rows[0]["country"], rows[0]["category"]),
+                         ("CNN", "CNN.us", "US", "News"))
+
+    def test_json_categories_run_from_the_node_to_its_ancestors(self):
+        data = {"groups": [{"group": "XXX", "channels": [{"name": "N", "genre": "Movies",
+                                                          "url": "https://cdn.example.org/n.m3u8"}]},
                            {"name": "News", "categories": ["news", 5, "world"], "url": "https://cdn.example.org/w.m3u8"}]}
         rows = list(lists.parse_json_list(data, SOURCE))
-        self.assertEqual([(r["name"], r["category"]) for r in rows], [("Neutral", "XXX Movies"), ("News", "news;world")])
-        self.assertEqual(verdict(rows[0], ALLOW).bucket, "nsfw")
+        self.assertEqual([(r["name"], r["category"]) for r in rows], [("N", "Movies; XXX"), ("News", "news; world")])
+        self.assertEqual([verdict(r, ALLOW).bucket for r in rows], ["nsfw", "public"])
+
+    def test_long_json_ancestors_do_not_cut_an_nsfw_category(self):
+        genres = [f"Genre {n}" for n in range(40)]  # over MAX_NAME once joined
+        child = {"name": "Neutral", "genre": "XXX", "url": "https://cdn.example.org/n.m3u8"}
+        middle = {"categories": genres, "channels": [{"name": "Deep", "genre": "Movies",
+                                                      "url": "https://cdn.example.org/d.m3u8"}]}
+        rows = list(lists.parse_json_list({"categories": genres, "channels": [child]}, SOURCE))
+        rows += lists.parse_json_list({"group": "XXX", "sections": [middle]}, SOURCE)
+        self.assertEqual([verdict(r, ALLOW).bucket for r in rows], ["nsfw", "nsfw"])
+        self.assertTrue(all(len(r["category"]) <= lists.MAX_NAME for r in rows))
+
+    def test_a_json_drm_key_marks_its_own_urls_only(self):
+        # run 12 shapes: teleonline's root "license" is its content licence; Zappr's clearkey channel has a non-DRM
+        # fallback
+        data = {"license": {"source": "Lists Example", "terms": "CC BY 4.0"},
+                "channels": [{"name": "La 1", "url": "https://cdn.example.org/la1.m3u8"},
+                             {"name": "HR", "url": "https://cdn.example.org/hr/cenc-default.m3u8", "license": "clearkey",
+                              "fallback": {"url": "https://cdn.example.org/hr/fallback.m3u8"}}]}
+        self.assertEqual([(r["url"].rsplit("/", 1)[1], r["notes"]) for r in lists.parse_json_list(data, SOURCE)],
+                         [("la1.m3u8", "-"), ("cenc-default.m3u8", "license key (DRM)"), ("fallback.m3u8", "-")])
+
+    def test_logo_urls_and_adult_in_names_are_not_nsfw_signals(self):
+        rows = list(lists.parse_m3u(  # run 12 lines that went nsfw on a whole-line category check
+            '#EXTINF:-1 tvg-name="Max Sport 4" tvg-logo="https://i.imgur.com/7IxXX6f.png" group-title="Sports",'
+            'Max Sport 4\nhttps://cdn.example.org/1.m3u8\n'
+            '#EXTINF:-1 tvg-name="Pluto TV Adult Animation" group-title="Animation",Pluto TV Adult Animation\n'
+            'https://cdn.example.org/2.m3u8\n'
+            '#EXTINF:-1 tvg-id="Adult Swim" tvg-logo="https://i.ibb.co/k/logo-Adult-Swim.png" group-title="TV",'
+            'Adult Swim | Mexico\nhttps://cdn.example.org/3.m3u8\n#EXTINF:-1,Pop Adult\nhttps://cdn.example.org/4.m3u8\n',
+            SOURCE))
+        self.assertEqual([verdict(r, ALLOW).bucket for r in rows], ["public"] * 4)
 
     def test_other_host_json_is_never_parsed(self):
         body = lists.Fetched(SOURCE, SOURCE, b'[{"name": "A", "url": "https://a.example/a.m3u8"}]')
@@ -446,11 +498,25 @@ class PathTokenTest(unittest.TestCase):
     """D16: token and DRM shapes in the path of a URL iptv-org does not list verbatim."""
 
     def test_signed_and_session_paths_are_minted(self):
+        webcaster = ("https://cdn.example.org/media/playlist/free_672d700f2f9510be660253786e4406fe_hd/33_85479982/1080p/"
+                     "4eaec8986e2012fb936478856fbf3b4b/4818731006.m3u8")
         for url in ("https://cdn.example.org/_token/v1.1790056588.nji8saooj4L1tbq7mfidDHdtnEaKU9-Igx3QHhVVgXc/i.m3u8",
                     "https://cdn.example.org/v1/master/0547f1/prod/bitok/eyJzdGlkIjoiMDEyMyJ9/playlist.m3u8",
-                    "https://cdn.example.org/live/c.m3u8#token=ab12"):  # a fragment key
+                    "https://cdn.example.org/live/c.m3u8#token=ab12",  # a fragment key
+                    webcaster, "https://cdn.example.org/live/69393EAE6ADBC65A68F942022362A202/13.m3u8",
+                    "https://cdn.example.org/tok_eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjF9.c2ln/live/a.m3u8"):  # a glued JWT
             self.assertEqual(verdict(copy(url), ALLOW), rules.Verdict("private", "minted"), url)
         self.assertEqual(verdict(copy("https://cdn.example.org/live/c.m3u8#t=0.1"), ALLOW).bucket, "public")
+        listed = Allowlist([webcaster], parse_reviewed(""), vouches)
+        self.assertEqual(verdict(copy(webcaster), listed).bucket, "public")  # iptv-org's exact URL
+        for url in ("https://cdn.example.org/brightcove/0123456789abcdef0123456789abcdef/us-east-1/a.m3u8",
+                    "https://cdn.example.org/0123456789abcdef0123456789abcdef/index.m3u8"):
+            self.assertEqual(verdict(copy(url), ALLOW).bucket, "public", url)
+
+    def test_long_token_key_runs_keep_their_verdicts(self):
+        for key, minted in (("token" * 3 + "_id", True), ("token" * 3 + ".x", False), ("Wowzatokenhash", True),
+                            ("aws.sessionId", True), ("x-amz-signature", True), ("ads.apikey", True), ("tokens.x", False)):
+            self.assertEqual(rules.token_shaped(f"https://cdn.example.org/a.m3u8?{key}=1"), minted, key)
 
     def test_drm_named_in_the_path_is_drm_unless_iptv_org_lists_the_url(self):
         for url in ("https://cdn.example.org/LA7D/DRM/HLS/Live.m3u8", "https://cdn.example.org/m6/cmaf_cenc00/d.mpd",
@@ -458,7 +524,10 @@ class PathTokenTest(unittest.TestCase):
             self.assertEqual(verdict(copy(url), ALLOW), rules.Verdict("private", "drm"), url)
         listed = Allowlist(["https://cdn.example.org/drm/smil:tv.smil/index.m3u8"], parse_reviewed(""), vouches)
         self.assertEqual(verdict(copy("https://cdn.example.org/drm/smil:tv.smil/index.m3u8"), listed).bucket, "public")
-        self.assertEqual(verdict(copy("https://cdn.example.org/live/centre.m3u8"), ALLOW).bucket, "public")
+        for url in ("https://cdn.example.org/live_drm/index.mpd", "https://cdn.example.org/drm1/index.mpd"):
+            self.assertEqual(verdict(copy(url), ALLOW), rules.Verdict("private", "drm"), url)
+        for url in ("https://cdn.example.org/live/licencia.m3u8", "https://cdn.example.org/nondrm/a.m3u8"):
+            self.assertEqual(verdict(copy(url), ALLOW).bucket, "public", url)  # "cenc", "drm" inside words
 
     def test_kodi_drm_pairs_and_pipe_suffixes(self):
         rows = list(lists.parse_m3u("#EXTINF:-1,A\nhttps://a.example/a.mpd|drmScheme=clearkey&drmLicense=k:v\n",
@@ -466,6 +535,9 @@ class PathTokenTest(unittest.TestCase):
         self.assertEqual(rows[0]["notes"], "license pair (DRM)")
         rows = list(lists.parse_json_list([{"name": "B", "url": "https://b.example/b.mpd|drmLicense=k:v"}], SOURCE))
         self.assertEqual(rows[0]["notes"], "license key (DRM)")
+        rows = list(lists.parse_m3u("#EXTINF:-1,C\nhttps://c.example/c.mpd|drmScheme=widevine\n#EXTINF:-1,D\n"
+                                    "https://d.example/d.mpd|Kodi=clearkey\n", SOURCE))
+        self.assertEqual([r["notes"] for r in rows], ["license pair (DRM)"] * 2)  # a name or a value alone
         self.assertEqual(verdict(copy("https://cdn.example.org/a.m3u8|Cookie=sessid=abc"), ALLOW).reason,
                          "unreviewed-query")  # a research URL keeps its suffix verbatim
 
@@ -565,6 +637,15 @@ class ChannelsTest(unittest.TestCase):
         join.apply(row, ["Tab.us"])
         self.assertEqual((row["country"], row["category"], row["_bucket"]), ("U S", "news xxx", "nsfw"))
 
+    def test_an_unidentified_row_named_like_an_nsfw_channel_is_nsfw(self):
+        # D19 audit (run 13): Pluto DE erotic channels whose provider ids iptv-org maps to nothing
+        fast = pool_row("https://jmp2.uk/plu-0123456789abcdef01234567.m3u8", name="Late Show HD", country="DE")
+        self.join.apply(fast, [])
+        self.assertEqual((fast["channel"], fast["_bucket"]), ("pluto:0123456789abcdef01234567", "nsfw"))
+        identified = pool_row("https://iptv.example/a.m3u8", name="Late Show")  # CNN.us@East by its exact URL
+        self.join.apply(identified, [])
+        self.assertEqual(identified["_bucket"], "public")
+
     def test_helpers(self):
         self.assertEqual(name_key("ＢＢＣ One (720p) [Not 24/7] FHD"), "bbc one")
         self.assertEqual(provider_id("https://i.mjh.nz/%2Er/maori.m3u8"), "mjh:maori")
@@ -595,8 +676,8 @@ class BuildPoolTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             private = Path(d) / "priv"
-            for name, rows in seeds.items():
-                path = private / "seed" / name
+            for bucket, rows in seeds.items():
+                path = extract_research.seed_path(private, bucket)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("\n".join(["\t".join(OUT_COLUMNS)] + ["\t".join(r[c] for c in OUT_COLUMNS)
                                                                       for r in rows]) + "\n", encoding="utf-8")
@@ -626,8 +707,7 @@ class BuildPoolTest(unittest.TestCase):
         values["source_page"] = values["url"]
         def pick(name):
             return [r for r in list_rows if r["_bucket"] == name]
-        return {"research-public.tsv": [values] + pick("public"), "research-private.tsv": pick("private"),
-                "research-nsfw.tsv": pick("nsfw")}
+        return {"public": [values] + pick("public"), "private": pick("private"), "nsfw": pick("nsfw")}
 
     def test_a_run_writes_the_pool_and_pull_records(self):
         m3u = ('#EXTINF:-1 tvg-id="BBC.uk",BBC\nhttps://iptv.example/live/b.m3u8?token=9\n'
@@ -669,12 +749,12 @@ class BuildPoolTest(unittest.TestCase):
 
     def test_a_research_stream_citing_an_nsfw_research_list_is_nsfw(self):
         seeds = self.seeds(research(SOURCE, bucket="nsfw", reason="nsfw"))
-        seeds["research-public.tsv"][0]["source_page"] = SOURCE
+        seeds["public"][0]["source_page"] = SOURCE
         self.assertEqual(self.buckets(seeds, "")["https://iptv.example/r.m3u8"], "nsfw.tsv")
 
     def test_a_research_stream_citing_a_tainted_list_in_another_spelling_is_tainted(self):
         seeds = self.seeds(research(SOURCE, bucket="nsfw", reason="nsfw"))
-        seeds["research-public.tsv"][0]["source_page"] = "https://github.com/someone/lists/blob/refs/heads/main/all.m3u"
+        seeds["public"][0]["source_page"] = "https://github.com/someone/lists/blob/refs/heads/main/all.m3u"
         self.assertEqual(self.buckets(seeds, "")["https://iptv.example/r.m3u8"], "nsfw.tsv")
 
     def test_a_duplicate_target_keeps_the_strictest_taint(self):
@@ -694,6 +774,14 @@ class BuildPoolTest(unittest.TestCase):
         del remote[lists.FAST_INDEXES["roku"][0]]
         self.assertEqual(self.run_main(remote, self.seeds()), (1, {}))
         self.assertEqual(self.run_main(self.remote(streams={"not": "a list"}), self.seeds()), (1, {}))
+
+    def test_swapped_repos_are_refused_before_anything_runs(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "pub" / "harvest").mkdir(parents=True)
+            with mock.patch.object(build_pool, "fetch_required", side_effect=AssertionError("ran")), \
+                    mock.patch.object(sys, "argv", ["x", str(Path(d) / "priv"), str(Path(d) / "pub")]), \
+                    redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                build_pool.main()
 
     def test_the_egress_ip_in_a_public_row_fails_before_writing(self):
         url = "https://iptv.example/live/3405803783/a.m3u8"

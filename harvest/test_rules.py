@@ -4,6 +4,7 @@ Run: python3 -m unittest discover -s harvest
 Test IPs are documentation addresses (RFC 5737): 203.0.113.7 = 3405803783 = 0xCB007107 (203*2^24 + 113*2^8 + 7);
 its little-endian form 07 71 00 CB = 124846283.
 """
+import argparse
 import base64
 import io
 import json
@@ -446,24 +447,30 @@ def tsv_line(name, url):
 
 
 class MainTest(unittest.TestCase):
-    def run_main(self, tsv_block: str, listed: list[str], ips=(TEST_IP,)) -> tuple[int, dict[str, str]]:
-        """Runs main on one report; returns its exit code and the files written (name -> text)."""
+    def run_main(self, tsv_block: str, listed: list[str], old_style: bool = False) -> tuple[int, dict[str, str]]:
+        """Runs main on one report; returns its exit code and the files written (name -> text). old_style: the
+        pre-D16 command line (<public> <private> <runs>), with a public checkout holding harvest/."""
         with tempfile.TemporaryDirectory() as d:
             run = Path(d) / "2026-11-06-000000-test"
             run.mkdir()
             (run / "01-lane.md").write_text("# r\n\n```tsv\n" + tsv_block + "```\n", encoding="utf-8")
             streams = Path(d) / "streams.json"
             streams.write_text(json.dumps([{"url": u} for u in listed]), encoding="utf-8")
-            argv = ["x", "--streams", str(streams), str(Path(d) / "priv"), str(run)]
-            lookup = (mock.patch.object(egress, "known_ips", side_effect=egress.LookupFailed("down")) if ips is None
-                      else mock.patch.object(egress, "known_ips", return_value=set(ips)))
-            with mock.patch.object(sys, "argv", argv), lookup, redirect_stdout(io.StringIO()), \
-                    redirect_stderr(io.StringIO()):
-                code = extract_research.main()
+            repos = [str(Path(d) / "priv")]
+            if old_style:
+                (Path(d) / "pub" / "harvest").mkdir(parents=True)
+                (Path(d) / "priv").mkdir()
+                repos = [str(Path(d) / "pub"), str(Path(d) / "priv")]
+            argv = ["x", "--streams", str(streams), *repos, str(run)]
+            with mock.patch.object(sys, "argv", argv), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                try:
+                    code = extract_research.main()
+                except SystemExit as exit_:  # argparse refused an argument
+                    code = exit_.code
             written = {p.name: p.read_text(encoding="utf-8") for p in Path(d).glob("p*/seed/*.tsv")}
         return code, written
 
-    def test_a_run_writes_all_four_seeds(self):
+    def test_a_run_writes_the_three_seeds(self):
         code, written = self.run_main(tsv_line("A", "https://a.example/a.m3u8") + "\n"
                                       + tsv_line("B", "https://b.example/b.m3u8") + "\n",
                                       ["https://a.example/a.m3u8"])
@@ -485,12 +492,20 @@ class MainTest(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn("https://a.example/a.m3u8", written["research-public.tsv"], name)
 
-    def test_seeds_are_private_and_publish_nothing(self):
-        # D16: build_pool alone publishes (and runs the egress gate); a seed run succeeds with no egress lookup.
-        code, written = self.run_main(tsv_line("A", "https://a.example/a.m3u8") + "\n", ["https://a.example/a.m3u8"],
-                                      ips=None)
+    def test_a_seed_run_needs_no_egress_lookup(self):
+        # D16: build_pool alone publishes (and runs the egress gate); seeds go to the private repo only.
+        with mock.patch.object(egress, "known_ips") as lookup:
+            code, _ = self.run_main(tsv_line("A", "https://a.example/a.m3u8") + "\n", ["https://a.example/a.m3u8"])
         self.assertEqual(code, 0)
-        self.assertEqual(sorted(written), ["research-nsfw.tsv", "research-private.tsv", "research-public.tsv"])
+        lookup.assert_not_called()
+
+    def test_the_old_command_line_is_refused_before_writing(self):
+        # <public> <private> <runs>: the public checkout as the private repo, a repo as a run directory.
+        code, written = self.run_main(tsv_line("A", "https://a.example/a.m3u8") + "\n", ["https://a.example/a.m3u8"],
+                                      old_style=True)
+        self.assertEqual((code, written), (2, {}))
+        with tempfile.TemporaryDirectory() as d, self.assertRaises(argparse.ArgumentTypeError):
+            extract_research.research_run(d)  # no NN-*.md reports
 
     def test_a_stream_citing_an_nsfw_research_list_in_another_spelling_is_nsfw(self):
         listed = "\t".join(["Erotica lists", "https://raw.githubusercontent.com/o/r/main/x.m3u"] + ["-"] * 3

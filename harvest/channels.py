@@ -5,7 +5,10 @@ order after the exact URL: the iptv-org channel[@feed] of the exact URL; the ipt
 (any query) when only one channel uses it; a FAST provider id (mapped to the iptv-org channel that uses the same id
 when only one does, else "<service>:<id>"); a tvg-id naming a channels.json id; a name + 2-letter country naming
 exactly one channels.json channel; else empty. A row whose channel key or tvg-id names a channel iptv-org blocklists
-or marks NSFW moves bucket. Every value taken from iptv-org's files is cleaned with lists.cell before it is published.
+or marks NSFW moves bucket; so does a row whose key names no channels.json channel (empty, "<service>:<id>") and
+whose name is an NSFW channel's name or alt name in any country (Spec 60 D19 audit: iptv-org lists no stream for
+Pluto DE's erotic channels, so their provider ids map to nothing). Every value taken from iptv-org's files is cleaned
+with lists.cell before it is published.
 """
 import re
 import unicodedata
@@ -84,6 +87,9 @@ class Channels:
                                if isinstance(name, str) and name_key(name))
         self.blocked = {b["channel"].lower(): str(b.get("reason") or "listed") for b in blocklist
                         if isinstance(b, dict) and isinstance(b.get("channel"), str)}
+        self.nsfw_names = {name_key(name) for info in self.info.values() if info.get("is_nsfw") is True
+                           for name in [info.get("name")] + list(info.get("alt_names") or [])
+                           if isinstance(name, str) and name_key(name)}
 
     def key(self, row: dict, tvg_id: str) -> str:
         """The channel key of one pool row (module docstring)."""
@@ -121,6 +127,8 @@ class Channels:
             self._flag(row, info)
         info = named[0]
         if info is None:
+            if name_key(row["name"]) in self.nsfw_names and row["_bucket"] != "nsfw":
+                row["_bucket"], row["reason"] = "nsfw", "nsfw"
             return
         if row["country"] in ("", "-") and isinstance(info.get("country"), str):
             row["country"] = cell(info["country"])

@@ -11,8 +11,9 @@ also carries that list's verdict: lists.list_taints), copies are merged by exact
 gets its channel key and the iptv-org blocklist/NSFW joins (channels.py). streams.tsv is the only public output
 (D16). Fetching iptv-org's API (streams, channels, blocklist) or a FAST index failing fails the run (exit 1); a
 research list failing is recorded in pulls.tsv. Before anything is written every public row is checked for this
-machine's egress IP (egress.py); a hit or a failed lookup fails the run and nothing is written. Outputs (plain TSV,
-values verbatim):
+machine's egress IP (egress.py); a hit or a failed lookup fails the run and nothing is written. A private repo that
+is the public checkout (swapped arguments) is refused (extract_research.private_repo). Outputs (plain TSV, values
+verbatim):
   <public>/pool/streams.tsv     public candidate streams (extract_research.OUT_COLUMNS + channel)
   <private>/pool/private.tsv    private rows with their reason
   <private>/pool/nsfw.tsv       NSFW rows
@@ -30,7 +31,7 @@ import egress
 import lists
 from allowlist import REVIEWED_HOSTS, Allowlist, parse_reviewed, stream_urls
 from channels import Channels
-from extract_research import COLUMNS, OUT_COLUMNS, tsv, write_all
+from extract_research import COLUMNS, OUT_COLUMNS, SEED_BUCKETS, private_repo, seed_path, tsv, write_all
 from rules import LIST_KINDS, Verdict, merge, stricter, verdict, vouches
 
 POOL_COLUMNS = OUT_COLUMNS + ["channel"]
@@ -92,8 +93,7 @@ def pull_lists(research_lists: list[dict], taints: dict[str, Verdict | None]) \
 
 def research_seeds(private: Path) -> list[dict[str, str]]:
     """Every research seed row, its bucket (the file it is in) under "_bucket"."""
-    return [{**row, "_bucket": name} for name in ("public", "private", "nsfw")
-            for row in read_tsv(private / "seed" / f"research-{name}.tsv")]
+    return [{**row, "_bucket": name} for name in SEED_BUCKETS for row in read_tsv(seed_path(private, name))]
 
 
 def seen_in(origins: str) -> str:
@@ -106,7 +106,7 @@ def seen_in(origins: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build the Spec 60 candidate pool from every list endpoint.")
     parser.add_argument("public", type=Path)
-    parser.add_argument("private", type=Path)
+    parser.add_argument("private", type=private_repo)
     args = parser.parse_args()
     try:
         required = fetch_required()
