@@ -80,7 +80,19 @@ class Needles:
         self.raw = [("raw", packed), ("raw-le", packed[::-1])]
 
 
-def _decoded_runs(layer: bytes):
+def layers(text: str) -> list[bytes]:
+    """The text as bytes, then each URL-decoded layer that differs from the one before (up to URL_DECODE_LAYERS)."""
+    found = [text.encode("utf-8", "surrogateescape")]
+    for _ in range(URL_DECODE_LAYERS):
+        decoded = unquote_to_bytes(found[-1])
+        if decoded == found[-1]:
+            break
+        found.append(decoded)
+    return found
+
+
+def decoded_runs(layer: bytes):
+    """Bytes decoded from every hex run (both nibble alignments) and base64/base64url run (all four alignments)."""
     for run in HEX_RUN.findall(layer):
         for skip in range(2):
             chunk = run[skip:]
@@ -100,20 +112,28 @@ def _decoded_runs(layer: bytes):
 
 def find(text: str, needles: list[Needles]) -> list[str]:
     """The forms of any needle IP found in the text (empty when clean)."""
-    layers = [text.encode("utf-8", "surrogateescape")]
-    for _ in range(URL_DECODE_LAYERS):
-        decoded = unquote_to_bytes(layers[-1])
-        if decoded == layers[-1]:
-            break
-        layers.append(decoded)
     hits = []
     for needle in needles:
-        for layer in layers:
+        for layer in layers(text):
             hits += [form for form, pattern in needle.text if pattern.search(layer)]
-            for decoded in _decoded_runs(layer):
+            for decoded in decoded_runs(layer):
                 hits += [f"decoded:{form}" for form, pattern in needle.text if pattern.search(decoded)]
                 hits += [f"decoded:{form}" for form, raw in needle.raw if raw in decoded]
     return sorted(set(hits))
+
+
+def publish_gate(rows: list[dict], columns: list[str]) -> bool:
+    """Whether rows may be published: no cell holds a current or recorded egress IP in any form. Prints why not to
+    stderr (each leaking row's name and seen_in, never the URL that holds the IP); a failed lookup is a refusal."""
+    try:
+        needles = [Needles(ip) for ip in known_ips()]
+    except LookupFailed as error:
+        print(error, file=sys.stderr)
+        return False
+    leaks = [row for row in rows if find("\t".join(row[c] for c in columns), needles)]
+    for row in leaks:
+        print(f"  EGRESS IP in a public row: {row['name']} ({row['seen_in']})", file=sys.stderr)
+    return not leaks
 
 
 def _files(paths: list[str]):

@@ -9,26 +9,46 @@ Every candidate row lands in exactly one bucket; nothing is dropped:
 Rules match the row's own URL, name, category and source page. A list's notes often describe rows inside it
 ("contains NSFW, exclude"), so notes only count for DRM and minted URLs on a single stream row. The deny rules below
 stay as a second filter behind the allowlist; url_rejection() also decides which iptv-org URLs vouch for a host.
+
+One URL can be found several times (copies). A verdict about the stream itself (its URL, DRM, minted notes, the
+allowlist, NSFW) holds for every copy; a verdict about one copy only (it came from a listed pirate list or a dynamic
+source, or its own headers/notes/source cell carry a credential or token) yields to a clean public copy, whose cells
+are the ones published (merge()).
 """
+import base64
+import binascii
+import functools
+import json
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from typing import NamedTuple
 from urllib.parse import unquote
 
-from allowlist import Allowlist, split_url
+import egress
+from allowlist import Allowlist, has_suffix, split_url
 
 # Subscriber credentials in the URL (Xtream / Stalker panels, personal tokens). Xtream's short form
 # host/<user>/<pass>/<id> has no generic pattern: it also matches official CDNs (TVP's tokenizer API,
 # .../hls/8036/8036.m3u8), so the host list below and the allowlist are the defence for it. "p=" alone matches
-# broadcaster APIs.
+# broadcaster APIs. The URL-shaped alternatives (user:pass@host, Xtream) start at any scheme, not only at the text's
+# start, so an embedded URL counts too.
 CREDENTIAL = re.compile(
-    r"^[a-z][a-z0-9+.-]*://[^/@?#]+@|"  # user:pass@host
-    r"^https?://[^/]+/(?:live|movie|series|timeshift)/[^/?#]+/[^/?#]+/\d+(?:\.\w+)?(?:$|\?)|"  # Xtream
+    r"(?<![a-z0-9+.-])[a-z][a-z0-9+.-]*://[^/@?#\s]+@|"
+    r"(?<![a-z0-9+.-])https?://[^/?#\s]+/(?:live|movie|series|timeshift)/[^/?#]+/[^/?#]+/\d+(?:\.\w+)?(?:$|[?&#\s])|"
     r":2546[13]\b|/line/|/get\.php|[?&]mac=|play_token|[?&]ticket=|X-Plex-Token=|"
-    r"[?&](?:username|password|pass|pwd|passwd)=|"
+    r"[?&](?:username|password|pass|pwd|passwd|secret)=|"
     # Tvheadend's stream API on any port: a personal TV box or headend re-serving its tuner, not a broadcaster.
     r"/stream/channel(?:id|number)?/[0-9a-f]+(?:$|\?)",
     re.IGNORECASE,
 )
+
+# A URL can carry another one in an encoded layer: iptv-org listed tvstitch.com URLs whose base64 ?source= held a pay
+# restream's per-subscriber ip/id/secret and a JWT with the subscriber's phone number. CREDENTIAL and these claims
+# are also searched in the decoded layers (egress.layers, egress.decoded_runs).
+JWT_PAYLOAD = re.compile(r"eyJ[\w-]{8,}\.(eyJ[\w-]+)")
+PERSONAL_CLAIM = re.compile(r"phone|mobile|msisdn|e?mail|^tel$|^(?:client_?)?ip$|^user_?(?:id|name)$|^uid$",
+                            re.IGNORECASE)
+PERSONAL_VALUE = re.compile(r"[^@\s]+@[^@\s]+\.[a-z]{2,}|\+\d[\d -]{7,}\d", re.IGNORECASE)  # e-mail, +phone
 
 # Pay-channel restreams, pirate panels and third-party proxies named by the Spec 60 research
 # (R1 final report section c, W3 section 8 scope review). Host tokens match with boundaries (so
@@ -68,6 +88,7 @@ NSFW_NAME = re.compile(
     re.IGNORECASE,
 )
 NSFW_CATEGORIES = {"xxx", "adult", "erotic", "nsfw"}
+ADULT_WORD = re.compile(r"\badult\b(?!\s*swim)", re.IGNORECASE)  # free-text group-titles ("Adult Channels")
 
 DRM = re.compile(r"widevine|clearkey|playready|fairplay|sample-aes|\bcenc\b|license_url|kodiprop|\bdrm\b",
                  re.IGNORECASE)
@@ -79,14 +100,16 @@ NOT_DRM = re.compile(r"(?<!not )(?<!n't )(?<!n\u2019t )(?<!longer )(?<!never )\b
 
 # Minted URLs (D12): made for one requester, possibly binding its IP (a TVP path token minted by the research
 # fetches held this machine's IP). Spec 60 W3: never publish them; recipes resolve them on the viewer's device.
-# 1. Token-shaped URLs: signing/session query or path keys (Akamai, Wowza, Wangsu ws*, Tencent tx*, S3, MediaTailor
-#    aws.sessionId), path-token markers, DAI pod-serving (/stream/<uuid>) and MediaTailor session paths,
+# 1. Token-shaped URLs, also percent-encoded: signing/session query or path keys (Akamai, Wowza, Wangsu ws*, Tencent
+#    tx*, S3, MediaTailor aws.sessionId, ad-stitcher streaming ids), a query value that is an IP address (an ad
+#    stitcher's ads.ip=<requester>: minted for whoever built the list), path-token markers, DAI pod-serving (/stream/<uuid>) and MediaTailor session paths,
 #    Dailymotion sec(...) paths, Wowza session chunklists, an epoch+hash pair (e=<epoch>&h=), JWTs anywhere.
 TOKEN_URL = re.compile(
-    r"[?&;/~](?:hdnts|hdnea|hdntl|__hdnea__|[a-z_-]*token|tkn|wmsauthsign|wowzatoken\w*|jwt|auth|auth_key|policy|"
+    r"[?&;/~](?:hdnts|hdnea|hdntl|__hdnea__|[a-z_.-]*token|tkn|wmsauthsign|wowzatoken\w*|jwt|auth|auth_key|policy|"
     r"signature|key-pair-id|expires|exp|sig|sign|md5|hash|hmac|acl|validto|nva|nvb|sid|session|[a-z_.]*sessionid|"
-    r"_lsu_sa_|x-amz-[a-z-]+|api[-_]?key|__token__|ws(?:secret|time)|tx(?:secret|time)|__gda__|ec_secure|st|secure|"
-    r"nonce)=|[?&]e=\d{9,}&h=|[?&]h=[0-9a-f]+&e=\d{9,}|"
+    r"_lsu_sa_|x-amz-[a-z-]+|[a-z_.-]*api[-_]?key|__token__|ws(?:secret|time)|tx(?:secret|time)|__gda__|ec_secure|st|secure|"
+    r"nonce|[a-z_.]*streaming_?id)=|[?&]e=\d{9,}&h=|[?&]h=[0-9a-f]+&e=\d{9,}|"
+    r"[?&;][^=&#]*=(?:\d{1,3}\.){3}\d{1,3}(?=[&#;]|$)|"  # a query value that is an IPv4 address (ads.ip=<viewer>)
     r"/(?:token|tkn|session|signature)/|/expires?/\d|/stream/[0-9a-f]{8}-[0-9a-f-]{27}|"
     r"/v1/manifest/[^/]+/[^/]+/[0-9a-f]{8}-[0-9a-f-]{27}/|/sec\d?\(|chunklist_w\d|eyJ[\w-]{8,}\.eyJ",
     re.IGNORECASE,
@@ -105,15 +128,72 @@ STATIC_SOURCES = (
     "raw.githubusercontent.com", "gist.githubusercontent.com", "github.com", "gist.github.com", "api.github.com",
     "github.io", "gitlab.com", "gitlab.io", "bitbucket.org", "codeberg.org", "cdn.jsdelivr.net", "pastebin.com",
     "pastecode.dev", "i.mjh.nz",
+    # D14 (Arshad 2026-11-07): list files on web hosts, byte-identical on refetch.
+    "www.apsattv.com", "www.tdtchannels.com", "m3u.cl",
 )
 REDIRECT_PATH = re.compile(r"^/\.r/")  # i.mjh.nz/.r/<slug> answers each requester with a fresh redirect
 
 SCHEME = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
 
-# Higher wins when two rows share a URL (extract_research.merge).
-RANK = {"public": 0, "private": 1, "nsfw": 2}
 # Rows of these kinds point at many streams; every other kind is one stream.
 LIST_KINDS = ("list-endpoint", "api")
+
+
+class Verdict(NamedTuple):
+    bucket: str
+    reason: str
+    copy_only: bool = False  # private only because of this copy's source or cells (module docstring)
+
+
+def rank(verdict: Verdict) -> int:
+    """Merge rank, highest wins: nsfw > private for the stream itself > public > private for one copy only."""
+    if verdict.bucket == "nsfw":
+        return 3
+    if verdict.bucket == "public":
+        return 1
+    return 0 if verdict.copy_only else 2
+
+
+def _names_a_person(claims: object) -> bool:
+    """Whether decoded JWT claims, at any depth, name a person: a personal claim key with a value, or a value shaped
+    like an e-mail address or an international phone number."""
+    stack = [claims]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if PERSONAL_CLAIM.search(str(key)) and value not in (None, "", 0, [], {}):
+                    return True
+                stack.append(value)
+        elif isinstance(node, list):
+            stack.extend(node)
+        elif isinstance(node, str) and PERSONAL_VALUE.fullmatch(node.strip()):
+            return True
+    return False
+
+
+def _personal_jwt(text: str) -> bool:
+    """Whether the text holds a JWT whose payload names a person."""
+    for payload in JWT_PAYLOAD.findall(text):
+        try:
+            claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        except (binascii.Error, ValueError, RecursionError):  # UnicodeDecodeError, JSONDecodeError: ValueErrors
+            continue
+        if _names_a_person(claims):
+            return True
+    return False
+
+
+@functools.lru_cache(maxsize=1 << 18)
+def _hidden_credential(text: str) -> bool:
+    """A credential or a personal JWT in the text (a URL or a published cell) or any of its decoded layers (cached:
+    copies repeat URLs and source pages)."""
+    for layer in egress.layers(text):
+        for chunk in (layer, *egress.decoded_runs(layer)):
+            text = chunk.decode("utf-8", "replace")
+            if CREDENTIAL.search(text) or _personal_jwt(text):
+                return True
+    return False
 
 
 def url_rejection(url: str) -> tuple[str, str] | None:
@@ -124,13 +204,26 @@ def url_rejection(url: str) -> tuple[str, str] | None:
         return "private", "no-scheme"
     if not re.match(r"https?://", url, re.IGNORECASE):
         return "private", "non-http"
-    if CREDENTIAL.search(url):
+    if _hidden_credential(url):
         return "private", "credential"
     lowered = url.lower()
     for host, pattern in zip(PRIVATE_HOSTS, _HOST_PATTERNS):
         if pattern.search(lowered):
             return "private", f"listed:{host}"
     return None
+
+
+@functools.lru_cache(maxsize=1 << 18)
+def _token_shaped(text: str) -> bool:
+    """TOKEN_URL in the text or its percent-decoded layers (an encoded &apikey%3D is still a key)."""
+    return any(TOKEN_URL.search(layer.decode("utf-8", "replace")) for layer in egress.layers(text))
+
+
+def nsfw_category(text: str) -> bool:
+    """Whether a category cell names adult content: a listed token, an NSFW name term, or the word "adult" (not Adult
+    Swim). Pulled lists' group-titles are free text ("XXX Movies", "Adult Channels")."""
+    tokens = {c.strip() for c in re.split(r"[;,/|]", text.lower())}
+    return bool(tokens & NSFW_CATEGORIES or NSFW_NAME.search(text) or ADULT_WORD.search(text))
 
 
 def vouches(url: str) -> bool:
@@ -150,12 +243,7 @@ def _static_source(row: Mapping[str, str]) -> bool:
         return False
     host, _, segments = split
     path = unquote("/" + "/".join(segments))  # %2Er is the same redirector as .r
-    return any(host == s or host.endswith("." + s) for s in STATIC_SOURCES) and not REDIRECT_PATH.match(path)
-
-
-def _minted(row: Mapping[str, str], stream: bool) -> bool:
-    return bool(TOKEN_URL.search(row["url"])
-                or (stream and (MINTED_NOTES.search(row["notes"]) or not _static_source(row))))
+    return has_suffix(host, STATIC_SOURCES) and not REDIRECT_PATH.match(path)
 
 
 def _listed_source(source: str) -> str | None:
@@ -164,35 +252,73 @@ def _listed_source(source: str) -> str | None:
     return next((host for host, pattern in zip(PRIVATE_HOSTS, _HOST_PATTERNS) if pattern.search(lowered)), None)
 
 
-def bucket(row: Mapping[str, str], allow: Allowlist) -> tuple[str, str]:
-    """Returns (bucket, reason) for one row (extract_research.COLUMNS). NSFW is checked first so it never mixes into
-    private."""
-    categories = {c.strip() for c in re.split(r"[;,/|]", row["category"].lower())}
-    if NSFW_NAME.search(row["name"]) or categories & NSFW_CATEGORIES or NSFW_URL.search(row["source_page"]):
-        return "nsfw", "nsfw"
+def verdict(row: Mapping[str, str], allow: Allowlist) -> Verdict:
+    """The verdict for one copy (extract_research.COLUMNS). NSFW is checked first so it never mixes into private;
+    checks about the stream itself run before checks about this copy, so a copy failing both reports the former."""
+    if NSFW_NAME.search(row["name"]) or nsfw_category(row["category"]) or NSFW_URL.search(row["source_page"]):
+        return Verdict("nsfw", "nsfw")
     url = row["url"]
     rejected = url_rejection(url)
     if rejected:
-        return rejected
-    listed = _listed_source(row["source_page"])
-    if listed:
-        return "private", f"listed:{listed}"
-    # The other published cells: a credential or token written into headers, a source page or a stream's notes is
-    # published too. A list's notes describe its contents ("contains :25461 entries"), and a directly recorded row's
-    # source is its URL, judged above and by the exact-iptv-org exemption below.
+        return Verdict(*rejected)
     stream = row["kind"] not in LIST_KINDS
-    columns = ("headers",) + (("notes",) if stream else ()) + (("source_page",) if row["source_page"] != url else ())
-    for column in columns:
-        if CREDENTIAL.search(row[column]):
-            return "private", "credential"
-        if TOKEN_URL.search(row[column]):
-            return "private", "minted"
     # DRM is a property of the stream itself; for a list endpoint the notes describe its contents.
     if stream and (DRM.search(row["format"]) or DRM.search(NOT_DRM.sub("", row["name"]))
                    or DRM.search(NOT_DRM.sub("", row["notes"]))):
-        return "private", "drm"
+        return Verdict("private", "drm")
     # iptv-org published this exact string, so it was not minted for our fetches alone.
-    if url not in allow.urls and _minted(row, stream):
-        return "private", "minted"
+    listed_by_iptv_org = url in allow.urls
+    if not listed_by_iptv_org and (_token_shaped(url) or (stream and MINTED_NOTES.search(row["notes"]))):
+        return Verdict("private", "minted")
+    listed = _listed_source(row["source_page"])
+    if listed:
+        return Verdict("private", f"listed:{listed}", copy_only=True)
+    # The other published cells: a credential or token written into headers, a source page or a stream's notes is
+    # published too. A list's notes describe its contents ("contains :25461 entries"), and a directly recorded row's
+    # source is its URL, judged above and by the exact-iptv-org exemption.
+    columns = ("headers",) + (("notes",) if stream else ()) + (("source_page",) if row["source_page"] != url else ())
+    for column in columns:
+        if _hidden_credential(row[column]):
+            return Verdict("private", "credential", copy_only=True)
+        if _token_shaped(row[column]):
+            return Verdict("private", "minted", copy_only=True)
+    if stream and not listed_by_iptv_org and not _static_source(row):
+        return Verdict("private", "minted", copy_only=True)
     criterion = allow.admit(url)
-    return ("public", criterion) if criterion else ("private", "unreviewed-host")
+    return Verdict("public", criterion) if criterion else Verdict("private", "unreviewed-host")
+
+
+def bucket(row: Mapping[str, str], allow: Allowlist) -> tuple[str, str]:
+    """(bucket, reason) for one copy."""
+    return verdict(row, allow)[:2]
+
+
+def _severity(verdict: Verdict) -> int:
+    return {"nsfw": 3, "public": 0}.get(verdict.bucket, 1 if verdict.copy_only else 2)
+
+
+def stricter(found: Verdict, taint: Verdict | None) -> Verdict:
+    """The stricter of a copy's own verdict and the taint of the list it came from. Within one copy any fault counts
+    (nsfw > private for the stream > private for this copy > public); across copies merge() ranks instead."""
+    return taint if taint is not None and _severity(taint) > _severity(found) else found
+
+
+def merge(copies: Iterable[tuple[Mapping[str, str], str, Verdict]]) -> dict[str, dict]:
+    """Dedupes (row, origin, verdict) copies by exact URL. The highest-ranked verdict wins (rank()) and its copy's cells
+    are kept; the first copy wins a tie. seen_in lists every distinct origin, first seen first; tvg_id is the first
+    non-empty one of any copy."""
+    kept: dict[str, dict] = {}
+    seen: dict[str, dict[str, None]] = {}
+    tvg_ids: dict[str, str] = {}
+    for row, where, found in copies:
+        url = row["url"]
+        old = kept.get(url)
+        if old is None or rank(found) > old["_rank"]:
+            kept[url] = {**row, "reason": found.reason, "_bucket": found.bucket, "_rank": rank(found)}
+        seen.setdefault(url, {})[where] = None
+        if row.get("tvg_id"):
+            tvg_ids.setdefault(url, row["tvg_id"])
+    for url, row in kept.items():
+        row["seen_in"] = ",".join(seen[url])
+        row["tvg_id"] = tvg_ids.get(url, "")
+    return kept

@@ -16,9 +16,10 @@ from unittest import mock
 
 import egress
 import extract_research
+import rules
 from allowlist import REVIEWED_HOSTS, Allowlist, iptv_org_urls, parse_reviewed
-from extract_research import COLUMNS, OUT_COLUMNS, merge, tsv
-from rules import bucket, vouches
+from extract_research import COLUMNS, OUT_COLUMNS, tsv
+from rules import bucket, verdict, vouches
 
 IPTV_ORG = [
     "https://iptv.example/listed.m3u8",
@@ -402,6 +403,10 @@ class EgressTest(unittest.TestCase):
         self.assertNotIn("3405803783", out.getvalue())
 
 
+def merge(pairs):
+    return rules.merge((r, where, verdict(r, ALLOW)) for r, where in pairs)
+
+
 def row(url, notes="-", name="Channel"):
     values = dict.fromkeys(COLUMNS, "-")
     values.update(name=name, url=url, kind="stream", format="hls", notes=notes, source_page=url)
@@ -412,14 +417,14 @@ class MergeTsvTest(unittest.TestCase):
     def test_one_url_lands_in_one_bucket_the_most_restrictive(self):
         url = "https://x.example/a.mpd"
         for order in ((row(url), row(url, notes="Widevine")), (row(url, notes="Widevine"), row(url))):
-            kept = merge([(order[0], "r1/01"), (order[1], "r1/02")], ALLOW)
+            kept = merge([(order[0], "r1/01"), (order[1], "r1/02")])
             self.assertEqual(len(kept), 1)
             self.assertEqual((kept[url]["_bucket"], kept[url]["reason"], kept[url]["seen_in"]),
                              ("private", "drm", "r1/01,r1/02"))
 
     def test_nsfw_outranks_private_for_one_url(self):
         url = "http://80.79.6.221:25461/a/b/1"
-        kept = merge([(row(url), "r1/01"), (row(url, name="Erotica"), "r1/02")], ALLOW)
+        kept = merge([(row(url), "r1/01"), (row(url, name="Erotica"), "r1/02")])
         self.assertEqual((kept[url]["_bucket"], kept[url]["reason"]), ("nsfw", "nsfw"))
 
     def test_tsv_refuses_a_tab(self):

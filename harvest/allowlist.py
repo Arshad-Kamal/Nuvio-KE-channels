@@ -8,8 +8,9 @@ Anything else is private with reason "unreviewed-host"; adding an entry to revie
 The two host criteria compare a tenant key, not a bare hostname: host[:port] (default ports dropped), plus the owner
 path on a code or path-style storage host (raw.githubusercontent.com/<owner>), so one listed owner does not admit
 every other owner. Hosts where anyone can publish under one name (shorteners, file shares, video platforms), hosts
-named as proxies, and URLs that carry another URL have no tenant: only an exact iptv-org URL or a reviewed path admits
-them. Only iptv-org URLs that pass the URL deny rules vouch for a host (rules.vouches). A URL whose host or path
+named as proxies, URLs that carry another URL, and URLs shaped like Xtream's short form host/<user>/<pass>/<id>
+(iptv-org lists such panel URLs, and one listed URL must not admit its siblings' logins) have no tenant: only an exact
+iptv-org URL or a reviewed path admits them. Only iptv-org URLs that pass the URL deny rules vouch for a host (rules.vouches). A URL whose host or path
 another parser could read differently (a backslash, non-ASCII or percent-encoded host; a dot segment or encoded
 slash in the path) is admitted by nothing but an exact iptv-org URL.
 """
@@ -20,9 +21,10 @@ from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-IPTV_ORG_STREAMS = "https://iptv-org.github.io/api/streams.json"
+IPTV_ORG_API = "https://iptv-org.github.io/api/"
+IPTV_ORG_STREAMS = IPTV_ORG_API + "streams.json"
 REVIEWED_HOSTS = Path(__file__).with_name("reviewed-hosts.txt")
-MAX_DOWNLOAD = 64 << 20  # streams.json is ~4 MB
+MAX_DOWNLOAD = 64 << 20  # streams.json is ~4 MB; also the cap on every list the pool pulls (lists.fetch)
 
 # i.mjh.nz's .channels.json indexes carry channel ids, not stream hosts, so the services' stream hosts are named here:
 # the operator's redirectors (jmp2.uk, i./c.mjh.nz), Pluto, Plex, Roku, and the playout vendors Samsung TV Plus
@@ -54,6 +56,9 @@ EMBEDDED_URL = re.compile(
     re.IGNORECASE,
 )
 URL_DECODE_LAYERS = 3
+# Three path segments ending in a number: Xtream's short form (no generic deny pattern: official CDNs share the
+# shape, e.g. /hls/KBS/03.m3u8, so those lose host-level admission only).
+SHORT_PANEL_PATH = re.compile(r"/[^/?#]+/[^/?#]+/\d+(?:\.\w+)?")
 HOST_SHAPE = re.compile(r"[a-z0-9.-]+|[0-9a-f:.]+")  # an ASCII name, an IPv4 address or an IPv6 literal
 DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -98,7 +103,8 @@ def _embeds_url(url: str) -> bool:
     return False
 
 
-def _has_suffix(host: str, suffixes: tuple[str, ...]) -> bool:
+def has_suffix(host: str, suffixes: tuple[str, ...]) -> bool:
+    """Whether the host is one of the suffixes or a subdomain of one."""
     return any(host == s or host.endswith("." + s) for s in suffixes)
 
 
@@ -108,7 +114,9 @@ def tenant(url: str) -> str | None:
     if split is None:
         return None
     host, netloc, segments = split
-    if _has_suffix(host, OPEN_HOSTS) or PROXY_LABEL.search(host) or _embeds_url(url):
+    if has_suffix(host, OPEN_HOSTS) or PROXY_LABEL.search(host) or _embeds_url(url):
+        return None
+    if SHORT_PANEL_PATH.fullmatch(urlsplit(url.strip()).path):
         return None
     depth = _owner_depth(host)
     if len(segments) < depth:
@@ -132,11 +140,18 @@ def parse_reviewed(text: str) -> list[tuple[str, list[str]]]:
                 or not re.fullmatch(r"\d*", port) or port in ("80", "443")):
             raise ValueError(f"reviewed-hosts line {number}: write host[:port][/path] without a default port, "
                              f"got {entry!r}")
-        needed = max(_owner_depth(host), 1 if _has_suffix(host, OPEN_HOSTS) else 0)
+        needed = max(_owner_depth(host), 1 if has_suffix(host, OPEN_HOSTS) else 0)
         if len(segments) < needed:
             raise ValueError(f"reviewed-hosts line {number}: {host} is shared; add the owner path")
         entries.append((_netloc(host, port), segments))
     return entries
+
+
+def stream_urls(streams: object) -> list[str]:
+    """Every stream URL in parsed streams.json data."""
+    if not isinstance(streams, list):
+        raise ValueError("streams.json: expected a JSON array")
+    return [s["url"] for s in streams if isinstance(s, dict) and isinstance(s.get("url"), str)]
 
 
 def iptv_org_urls(path: Path | None = None) -> list[str]:
@@ -148,7 +163,7 @@ def iptv_org_urls(path: Path | None = None) -> list[str]:
             data = response.read(MAX_DOWNLOAD + 1)
         if len(data) > MAX_DOWNLOAD:
             raise ValueError(f"{IPTV_ORG_STREAMS} is over {MAX_DOWNLOAD} bytes")
-    return [s["url"] for s in json.loads(data) if isinstance(s, dict) and isinstance(s.get("url"), str)]
+    return stream_urls(json.loads(data))
 
 
 class Allowlist:
@@ -171,7 +186,7 @@ class Allowlist:
             return None
         host, netloc, segments = split
         key = tenant(url)
-        if key is not None and _has_suffix(host, FAST_SUFFIXES):
+        if key is not None and has_suffix(host, FAST_SUFFIXES):
             return "fast-host"
         if key is not None and key in self.tenants:
             return "iptv-org-host"

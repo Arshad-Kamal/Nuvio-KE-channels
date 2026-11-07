@@ -1,0 +1,128 @@
+"""Channel key and iptv-org joins for pool rows (Nuvio-Project Spec 60 H1b).
+
+Rows stay one per exact URL; the channel column groups alternates of one channel, keyed in the Spec 60 W3 dedupe
+order after the exact URL: the iptv-org channel[@feed] of the exact URL; the iptv-org channel of the same host+path
+(any query) when only one channel uses it; a FAST provider id (mapped to the iptv-org channel that uses the same id
+when only one does, else "<service>:<id>"); a tvg-id naming a channels.json id; a name + 2-letter country naming
+exactly one channels.json channel; else empty. A row whose channel key or tvg-id names a channel iptv-org blocklists
+or marks NSFW moves bucket. Every value taken from iptv-org's files is cleaned with lists.cell before it is published.
+"""
+import re
+import unicodedata
+from collections import defaultdict
+from collections.abc import Iterable
+from urllib.parse import unquote, urlsplit
+
+from lists import cell
+from rules import nsfw_category
+
+JMP2_SLUGS = {"plu": "pluto", "stvp": "samsung", "sam": "samsung", "rok": "roku", "plex": "plex"}
+JMP2_PATH = re.compile(r"/(plu|stvp|sam|rok|plex)-([A-Za-z0-9-]+?)(?:\.m3u8)?")
+PLUTO_PATH = re.compile(r"/channels?/([0-9a-f]{24})(?:/|$)", re.IGNORECASE)
+QUALITY = re.compile(r"\b(?:u?hd|fhd|sd|[48]k|hevc|h\.?26[45]|\d{3,4}[pi]|backup|geo-blocked|not 24/7)\b")
+COUNTRY_CODE = re.compile(r"[A-Za-z]{2}")
+
+
+def _split(url: str) -> tuple[str, str] | None:
+    """(host[:port], decoded path), or None for a malformed URL."""
+    try:
+        parts = urlsplit(url)
+        host, port = (parts.hostname or "").lower(), parts.port
+    except ValueError:
+        return None
+    return (f"{host}:{port}" if port else host), unquote(parts.path)
+
+
+def provider_id(url: str) -> str | None:
+    """"<service>:<id>" for a FAST URL (jmp2.uk slugs, Pluto stitcher paths, i.mjh.nz .r slugs), else None."""
+    split = _split(url)
+    if split is None:
+        return None
+    host, path = split
+    if host == "jmp2.uk" and (slug := JMP2_PATH.fullmatch(path)):
+        return f"{JMP2_SLUGS[slug[1]]}:{slug[2].lower()}"
+    if (host == "pluto.tv" or host.endswith(".pluto.tv")) and (channel := PLUTO_PATH.search(path)):
+        return f"pluto:{channel[1].lower()}"
+    if host == "i.mjh.nz" and path.startswith("/.r/") and len(path) > 4:
+        return "mjh:" + re.sub(r"\.m3u8$", "", path[4:].lower())
+    return None
+
+
+def _host_path(url: str) -> tuple[str, str] | None:
+    split = _split(url)
+    return split if split and split[0] and len(split[1]) > 1 else None
+
+
+def name_key(name: str) -> str:
+    """A channel name compared without case, width forms, bracketed tags or quality words."""
+    text = unicodedata.normalize("NFKC", name).casefold()
+    text = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", text)
+    return " ".join(re.findall(r"\w+", QUALITY.sub(" ", text)))
+
+
+def _unique(pairs: Iterable[tuple[object, str]]) -> dict:
+    """key -> value for the keys that map to exactly one value."""
+    found: dict[object, set[str]] = defaultdict(set)
+    for key, value in pairs:
+        found[key].add(value)
+    return {key: values.pop() for key, values in found.items() if len(values) == 1}
+
+
+class Channels:
+    def __init__(self, streams: list, channels: list, blocklist: list):
+        """iptv-org's streams.json, channels.json and blocklist.json, parsed."""
+        self.info = {c["id"].lower(): c for c in channels if isinstance(c, dict) and isinstance(c.get("id"), str)}
+        listed = [(s["url"], s["channel"], s.get("feed")) for s in streams
+                  if isinstance(s, dict) and isinstance(s.get("url"), str) and isinstance(s.get("channel"), str)]
+        self.by_url = {url: cell(f"{channel}@{feed}" if feed else channel, 100) for url, channel, feed in listed}
+        self.by_path = _unique((_host_path(url), channel) for url, channel, _ in listed if _host_path(url))
+        self.by_provider = _unique((provider_id(url), channel) for url, channel, _ in listed if provider_id(url))
+        self.by_name = _unique(((info["country"].upper(), name_key(name)), info["id"])
+                               for info in self.info.values() if isinstance(info.get("country"), str)
+                               for name in [info.get("name")] + list(info.get("alt_names") or [])
+                               if isinstance(name, str) and name_key(name))
+        self.blocked = {b["channel"].lower(): str(b.get("reason") or "listed") for b in blocklist
+                        if isinstance(b, dict) and isinstance(b.get("channel"), str)}
+
+    def key(self, row: dict, tvg_id: str) -> str:
+        """The channel key of one pool row (module docstring)."""
+        url = row["url"]
+        if url in self.by_url:
+            return self.by_url[url]
+        path = _host_path(url)
+        if path in self.by_path:
+            return self.by_path[path]
+        provider = provider_id(url)
+        if provider:
+            return self.by_provider.get(provider, provider)
+        info = self.info.get(tvg_id.split("@")[0].lower())
+        if info:
+            return cell(info["id"], 100)
+        codes = {c.upper() for c in re.split(r"[;,/ ]+", row["country"]) if COUNTRY_CODE.fullmatch(c)}
+        named = {self.by_name.get((code, name_key(row["name"]))) for code in codes} - {None}
+        return cell(named.pop(), 100) if len(named) == 1 else ""
+
+    def _flag(self, row: dict, info: dict) -> None:
+        """Moves the row when iptv-org blocklists the channel or marks it NSFW."""
+        blocked = self.blocked.get(info["id"].lower())
+        if (blocked == "nsfw" or info.get("is_nsfw") is True) and row["_bucket"] != "nsfw":
+            row["_bucket"], row["reason"] = "nsfw", "nsfw"
+        elif blocked and row["_bucket"] == "public":
+            row["_bucket"], row["reason"] = "private", cell(f"blocklist:{blocked}")
+
+    def apply(self, row: dict, tvg_id: str) -> None:
+        """Sets row["channel"]; a blocklisted or NSFW channel (by key or by a copy's tvg-id) moves the row out of
+        public (NSFW out of private too); empty country and category cells are filled from channels.json."""
+        row["channel"] = self.key(row, tvg_id)
+        named = [self.info.get(k.split("@")[0].lower()) for k in (row["channel"], tvg_id)]
+        for info in filter(None, named):
+            self._flag(row, info)
+        info = named[0]
+        if info is None:
+            return
+        if row["country"] in ("", "-") and isinstance(info.get("country"), str):
+            row["country"] = cell(info["country"])
+        if row["category"] in ("", "-") and isinstance(info.get("categories"), list):
+            row["category"] = cell(";".join(str(c) for c in info["categories"]))
+            if nsfw_category(row["category"]) and row["_bucket"] != "nsfw":
+                row["_bucket"], row["reason"] = "nsfw", "nsfw"

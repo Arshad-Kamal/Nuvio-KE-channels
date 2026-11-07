@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Builds the candidate pool from every list endpoint (Nuvio-Project Spec 60 H1b).
+
+Usage: build_pool.py <public-repo> <private-repo>
+
+Inputs, in merge order: iptv-org's streams.json; the i.mjh.nz FAST indexes (lists.FAST_INDEXES); the research
+seeds' stream rows (<public>/seed/research-streams.tsv, <private>/seed/research-private.tsv and research-nsfw.tsv);
+every research list endpoint that is a list file (lists.list_target), fetched now. Every copy is bucketed by
+rules.verdict (a row of a list the research put in nsfw, or private as a listed pirate list, also carries that list's
+verdict: list_taint), copies are merged by exact URL (rules.merge), then each row gets its channel key and the iptv-org
+blocklist/NSFW joins (channels.py). Fetching iptv-org's API (streams, channels, blocklist) or a FAST index failing
+fails the run (exit 1); a research list failing is recorded in pulls.tsv. Before anything is written every public
+row is checked for this machine's egress IP (egress.py); a hit or a failed lookup fails the run and nothing is
+written. Outputs (plain TSV, values verbatim):
+  <public>/pool/streams.tsv     public candidate streams (extract_research.OUT_COLUMNS + channel)
+  <private>/pool/private.tsv    private rows with their reason
+  <private>/pool/nsfw.tsv       NSFW rows
+  <private>/pool/pulls.tsv      every research list endpoint: what was fetched, its class and status, rows read
+seen_in names origins: iptv-org, fast:<service>, research, lists:<number of list files>.
+"""
+import argparse
+import collections
+import concurrent.futures
+import json
+import sys
+from pathlib import Path
+
+import egress
+import lists
+from allowlist import REVIEWED_HOSTS, Allowlist, parse_reviewed, stream_urls
+from channels import Channels
+from extract_research import COLUMNS, OUT_COLUMNS, tsv
+from rules import LIST_KINDS, Verdict, merge, stricter, verdict, vouches
+
+POOL_COLUMNS = OUT_COLUMNS + ["channel"]
+PULL_COLUMNS = ["url", "fetched", "class", "status", "rows"]
+IPTV_ORG_JOINS = ("channels.json", "blocklist.json")
+FETCH_WORKERS = 8
+
+
+def read_tsv(path: Path) -> list[dict[str, str]]:
+    """Rows of a seed file written by extract_research (header line, tab-separated, verbatim)."""
+    lines = path.read_text(encoding="utf-8").split("\n")
+    header = lines[0].split("\t")
+    return [dict(zip(header, line.split("\t"))) for line in lines[1:] if line]
+
+
+def fetch_required() -> dict[str, bytes]:
+    """iptv-org's API files and the FAST indexes; raises lists.FetchError when any fails."""
+    urls = [lists.IPTV_ORG_STREAMS] + [lists.IPTV_ORG_API + name for name in IPTV_ORG_JOINS] + [
+        source for source, _ in lists.FAST_INDEXES.values()]
+    with concurrent.futures.ThreadPoolExecutor(FETCH_WORKERS) as pool:
+        return {url: fetched.body for url, fetched in zip(urls, pool.map(lists.fetch, urls))}
+
+
+def list_taint(research: dict) -> Verdict | None:
+    """The verdict every row of a research list carries: nsfw for a list the research put in nsfw, private (this copy
+    only) for a listed pirate list; None otherwise."""
+    if research["_bucket"] == "nsfw":
+        return Verdict("nsfw", "nsfw")
+    if research["reason"].startswith("listed:"):
+        return Verdict("private", research["reason"], copy_only=True)
+    return None
+
+
+def _pull(target: tuple[dict, str | None, str]) -> tuple[dict, list[dict[str, str]]]:
+    """Fetches and parses one research list endpoint: (pulls.tsv row, rows read)."""
+    research, url, kind = target
+    record = {"url": research["url"], "fetched": url or "-", "class": kind, "status": "-", "rows": "0"}
+    if url is None:
+        return record, []
+    try:
+        fetched = lists.fetch(url)
+    except lists.FetchError as error:
+        record["status"] = lists.cell(f"error: {error}")
+        return record, []
+    record["fetched"] = fetched.final_url
+    found, rows = lists.parse_list(fetched)
+    if kind == "other-host" and found != "m3u":  # JSON from a non-static host is an API answer
+        found, rows = "not-a-list", []
+    record.update(status=found, rows=str(len(rows)))
+    return record, rows
+
+
+def pull_lists(research_lists: list[dict]) -> tuple[list[dict], list[tuple[list[dict[str, str]], Verdict | None]]]:
+    """pulls.tsv rows (one per research row, in research order) and, per fetched list, its rows and taint. Research
+    rows naming the same file are fetched once, with the strictest taint of all of them."""
+    targets, taints = [], {}
+    for research in research_lists:
+        url, kind = lists.list_target(research)
+        if url is not None:
+            taint, old = list_taint(research), taints.get(url, False)
+            if old is not False:
+                taints[url] = old if taint is None else taint if old is None else stricter(old, taint)
+                url, kind = None, "skip:duplicate"
+            else:
+                taints[url] = taint
+        targets.append((research, url, kind))
+    with concurrent.futures.ThreadPoolExecutor(FETCH_WORKERS) as pool:
+        results = list(pool.map(_pull, targets))
+    pulled = [(rows, taints[url]) for (_, url, _), (_, rows) in zip(targets, results) if url is not None]
+    return [record for record, _ in results], pulled
+
+
+def research_seeds(public: Path, private: Path) -> list[dict[str, str]]:
+    """Every research seed row, its bucket (the file it is in) under "_bucket"."""
+    files = [(public / "seed" / "research-streams.tsv", "public"), (public / "seed" / "research-sources.tsv", "public"),
+             (private / "seed" / "research-private.tsv", "private"), (private / "seed" / "research-nsfw.tsv", "nsfw")]
+    return [{**row, "_bucket": name} for path, name in files for row in read_tsv(path)]
+
+
+def seen_in(origins: str) -> str:
+    tags = origins.split(",")
+    named = [t for t in tags if not t.startswith("list:")]
+    count = len(tags) - len(named)
+    return ",".join(named + ([f"lists:{count}"] if count else []))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Build the Spec 60 candidate pool from every list endpoint.")
+    parser.add_argument("public", type=Path)
+    parser.add_argument("private", type=Path)
+    args = parser.parse_args()
+    try:
+        required = fetch_required()
+        streams = json.loads(required[lists.IPTV_ORG_STREAMS])
+        joins = [json.loads(required[lists.IPTV_ORG_API + name]) for name in IPTV_ORG_JOINS]
+        indexes = {service: json.loads(required[source]) for service, (source, _) in lists.FAST_INDEXES.items()}
+        fast = {service: list(lists.fast_rows(service, index)) for service, index in indexes.items()}
+        iptv_org = stream_urls(streams)
+        if not all(isinstance(data, list) for data in joins):
+            raise ValueError("iptv-org API: expected JSON arrays")
+    except (lists.FetchError, ValueError) as error:  # json.JSONDecodeError is a ValueError
+        print(f"required source failed: {error}", file=sys.stderr)
+        return 1
+    allow = Allowlist(iptv_org, parse_reviewed(REVIEWED_HOSTS.read_text(encoding="utf-8")), vouches)
+    seeds = research_seeds(args.public, args.private)
+    pulls, pulled = pull_lists([row for row in seeds if row["kind"] in LIST_KINDS])
+
+    def copies():
+        def tagged(rows, where, taint=None):
+            return ((row, where, stricter(verdict(row, allow), taint)) for row in rows)
+        yield from tagged(lists.iptv_org_rows(streams), "iptv-org")
+        for service, rows in fast.items():
+            yield from tagged(rows, f"fast:{service}")
+        yield from tagged(({c: row[c] for c in COLUMNS} for row in seeds if row["kind"] not in LIST_KINDS), "research")
+        for number, (rows, taint) in enumerate(pulled):
+            yield from tagged(rows, f"list:{number}", taint)
+
+    kept = merge(copies())
+    joined = Channels(streams, *joins)
+    for row in kept.values():
+        joined.apply(row, row["tvg_id"])
+        row["seen_in"] = seen_in(row["seen_in"])
+
+    def pick(name: str) -> list[dict]:
+        return [row for row in kept.values() if row["_bucket"] == name]
+
+    public = pick("public")
+    if not egress.publish_gate(public, POOL_COLUMNS):
+        return 1
+    outputs = {args.public / "pool" / "streams.tsv": tsv(public, POOL_COLUMNS),
+               args.private / "pool" / "private.tsv": tsv(pick("private"), POOL_COLUMNS),
+               args.private / "pool" / "nsfw.tsv": tsv(pick("nsfw"), POOL_COLUMNS),
+               args.private / "pool" / "pulls.tsv": tsv(pulls, PULL_COLUMNS)}
+    for path, text in outputs.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    report(kept, pulls, fast)
+    return 0
+
+
+def report(kept: dict[str, dict], pulls: list[dict], fast: dict[str, list]) -> None:
+    buckets = collections.Counter(row["_bucket"] for row in kept.values())
+    reasons = collections.Counter((row["_bucket"], row["reason"].split(":")[0]) for row in kept.values())
+    statuses = collections.Counter(p["status"].split(":")[0] if not p["class"].startswith("skip") else p["class"]
+                                   for p in pulls)
+    print(f"unique URLs {len(kept)}: public {buckets['public']}, private {buckets['private']}, nsfw {buckets['nsfw']}; "
+          f"FAST rows {', '.join(f'{s} {len(r)}' for s, r in fast.items())}; channel keys "
+          f"{sum(1 for r in kept.values() if r['channel'])}")
+    print(f"research list endpoints {len(pulls)}: " + ", ".join(f"{k} {n}" for k, n in sorted(statuses.items())))
+    for (name, reason), count in sorted(reasons.items()):
+        print(f"  {name} {reason or '-'}: {count}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

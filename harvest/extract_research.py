@@ -7,8 +7,8 @@ Each researcher report ends in a fenced ```tsv block with 11 columns (name, url,
 kind, format, headers, geo_hint, source_page, notes). Rows with another column count are analysis tables and are
 skipped and counted; a skipped line that holds a URL (any "scheme://") fails the run (exit 1). A block's first
 line is dropped only when it is a header (its first cell is exactly "name"); otherwise it is read as data. Rows are
-deduplicated by exact URL: the first row's data is kept, the most restrictive bucket of all its copies wins
-(nsfw > private > public), and every report that recorded the URL is listed in seen_in. The allowlist
+deduplicated by exact URL (rules.merge: the highest-ranked copy wins, a copy private only for its own source or cells
+yields to a public copy), and every report that recorded the URL is listed in seen_in. The allowlist
 (allowlist.py) is built from iptv-org's streams.json (downloaded unless --streams names a local copy) and
 reviewed-hosts.txt. Before anything is written, every public row is checked for this machine's egress IP
 (egress.py); a hit or a failed lookup fails the run (exit 1) and no file is written. Outputs (plain TSV, values
@@ -26,7 +26,7 @@ from pathlib import Path
 
 import egress
 from allowlist import Allowlist
-from rules import LIST_KINDS, RANK, bucket, vouches
+from rules import LIST_KINDS, merge, verdict, vouches
 
 COLUMNS = ["name", "url", "country", "language", "category", "kind", "format", "headers", "geo_hint",
            "source_page", "notes"]
@@ -63,26 +63,11 @@ def rows_of(run_dir: Path, skipped: list[str], empty: list[str]):
                 yield row, f"{run}/{report.name[:2]}"
 
 
-def merge(rows, allow: Allowlist) -> dict[str, dict]:
-    """Dedupes (row, where) pairs by URL; the most restrictive bucket of any copy wins, with its reason."""
-    kept: dict[str, dict] = {}
-    for row, where in rows:
-        name, reason = bucket(row, allow)
-        old = kept.get(row["url"])
-        if old is None:
-            kept[row["url"]] = {**row, "reason": reason, "seen_in": where, "_bucket": name}
-            continue
-        if where not in old["seen_in"].split(","):
-            old["seen_in"] += "," + where
-        if RANK[name] > RANK[old["_bucket"]]:
-            old["_bucket"], old["reason"] = name, reason
-    return kept
-
-
-def tsv(rows: list[dict]) -> str:
-    lines = ["\t".join(OUT_COLUMNS)]
+def tsv(rows: list[dict], columns: list[str] | None = None) -> str:
+    columns = columns or OUT_COLUMNS
+    lines = ["\t".join(columns)]
     for r in rows:
-        values = [r[c] for c in OUT_COLUMNS]
+        values = [r[c] for c in columns]
         if any("\t" in v or "\n" in v for v in values):  # cells come from tab-split lines; never expected
             raise ValueError(f"tab or newline in a value: {r['url']}")
         lines.append("\t".join(values))
@@ -106,10 +91,11 @@ def main() -> int:
         for line in lost:
             print(f"  SKIPPED WITH A URL: {line[:200]}", file=sys.stderr)
         return 1
-    kept = merge(pairs, Allowlist.load(args.streams, vouches))
+    allow = Allowlist.load(args.streams, vouches)
+    kept = merge((row, where, verdict(row, allow)) for row, where in pairs)
 
     def pick(b: str, kinds: tuple[str, ...] | None = None) -> list[dict]:
-        return [{k: v for k, v in r.items() if k != "_bucket"} for r in kept.values()
+        return [{k: v for k, v in r.items() if not k.startswith("_")} for r in kept.values()
                 if r["_bucket"] == b and (kinds is None or r["kind"] in kinds)]
 
     streams = [r for r in pick("public") if r["kind"] not in LIST_KINDS]
@@ -118,15 +104,7 @@ def main() -> int:
                args.public / "seed" / "research-sources.tsv": tsv(sources),
                args.private / "seed" / "research-private.tsv": tsv(pick("private")),
                args.private / "seed" / "research-nsfw.tsv": tsv(pick("nsfw"))}
-    try:
-        needles = [egress.Needles(ip) for ip in egress.known_ips()]
-    except egress.LookupFailed as error:
-        print(error, file=sys.stderr)
-        return 1
-    leaks = [r for r in streams + sources if egress.find("\t".join(r[c] for c in OUT_COLUMNS), needles)]
-    if leaks:
-        for r in leaks:  # the row's name and origin, never the URL that holds the IP
-            print(f"  EGRESS IP in a public row: {r['name']} ({r['seen_in']})", file=sys.stderr)
+    if not egress.publish_gate(streams + sources, OUT_COLUMNS):
         return 1
     for path, text in outputs.items():
         path.parent.mkdir(parents=True, exist_ok=True)
