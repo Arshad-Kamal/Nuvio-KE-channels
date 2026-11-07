@@ -740,6 +740,21 @@ class ChannelsTest(unittest.TestCase):
             join.apply(row, [], names)
             self.assertEqual((row["channel"], row["_bucket"]), ("", "nsfw"), name)
 
+    def test_a_channel_the_owner_rules_nsfw_is_nsfw_by_key_tvg_id_and_name(self):
+        # D21: iptv-org files FashionTV Secrets SFW; a list files a copy "Erotic"
+        secrets = {"id": "FashionTVSecrets.fr", "name": "FashionTV Secrets", "alt_names": ["FTV Secrets"],
+                   "country": "FR", "categories": ["lifestyle"], "is_nsfw": False}
+        join = Channels([{"url": "https://ssai.example/s.m3u8?id=1", "channel": "FashionTVSecrets.fr", "feed": "HD"}],
+                        CHANNELS + [secrets], [])
+        exact, copied = pool_row("https://ssai.example/s.m3u8?id=1"), pool_row("https://other.example/s.m3u8")
+        named = pool_row("https://other.example/n.m3u8", name="FTV Secrets HD")
+        for row, tvg_ids in ((exact, []), (copied, ["FashionTVSecrets.fr"]), (named, [])):
+            join.apply(row, tvg_ids)
+        self.assertEqual([(r["_bucket"], r["reason"]) for r in (exact, copied, named)], [("nsfw", "nsfw")] * 3)
+        neighbour = pool_row("https://ssai.example/s.m3u8?id=2", name="Kids TV")  # another channel on the endpoint
+        join.apply(neighbour, [])
+        self.assertEqual((neighbour["channel"], neighbour["_bucket"]), ("FashionTVSecrets.fr", "public"))
+
     def test_an_unidentified_row_named_like_an_nsfw_channel_is_nsfw(self):
         # D19 audit (run 13): Pluto DE erotic channels whose provider ids iptv-org maps to nothing
         fast = pool_row("https://jmp2.uk/plu-0123456789abcdef01234567.m3u8", name="Late Show HD", country="DE")

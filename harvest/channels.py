@@ -1,15 +1,16 @@
 """Channel key and iptv-org joins for pool rows (Nuvio-Project Spec 60 H1b).
 
-Rows stay one per exact URL; the channel column groups alternates of one channel, keyed in the Spec 60 W3 dedupe
-order after the exact URL: the iptv-org channel[@feed] of the exact URL; the iptv-org channel of the same host+path
-(any query) when only one channel uses it; a FAST provider id (mapped to the iptv-org channel that uses the same id
-when only one does, else "<service>:<id>"); a tvg-id naming a channels.json id; a name + 2-letter country naming
-exactly one channels.json channel; else empty. A row whose channel key or tvg-id names a channel iptv-org blocklists
-or marks NSFW (Channels._nsfw) moves bucket; so does a row whose key names no channels.json channel (empty,
-"<service>:<id>") and whose name (any copy's) is an NSFW channel's name or alt name in any country (Spec 60 D19 audit:
-iptv-org lists no stream for Pluto DE's erotic channels, so their provider ids map to nothing). spread_nsfw then moves
-every URL holding a FAST channel id an nsfw row's URL holds (Spec 60 D20). Every value taken from iptv-org's files is
-cleaned with lists.cell before it is published.
+Rows stay one per exact URL; the channel column groups alternates of one channel, keyed in the Spec 60 W3 dedupe order
+after the exact URL: the iptv-org channel[@feed] of the exact URL; the iptv-org channel of the same host+path (any
+query) when only one channel uses it; a FAST provider id (mapped to the iptv-org channel that uses the same id when only
+one does, else "<service>:<id>"); a tvg-id naming a channels.json id; a name + 2-letter country naming exactly one
+channels.json channel; else empty. A row whose channel key or tvg-id names a channel iptv-org blocklists or marks NSFW
+(Channels._nsfw) moves bucket, as does one the owner rules NSFW (NSFW_CHANNELS: by the channel's own key or a tvg-id,
+never a host+path neighbour's key); so does a row whose key names no channels.json channel (empty, "<service>:<id>") and
+whose name (any copy's) is an NSFW channel's name or alt name in any country (Spec 60 D19 audit: iptv-org lists no
+stream for Pluto DE's erotic channels, so their provider ids map to nothing). spread_nsfw then moves every URL holding a
+FAST channel id an nsfw row's URL holds (Spec 60 D20). Every value taken from iptv-org's files is cleaned with
+lists.cell before it is published.
 """
 import re
 import unicodedata
@@ -32,6 +33,8 @@ SERVICE_DIRS = {"plutotv": "pluto", "samsungtvplus": "samsung", "roku": "roku", 
 FAST_ID_SHAPES = {"pluto": re.compile(r"[0-9a-f]{24}"), "samsung": re.compile(r"[a-z]{2,4}\d{6,}[a-z0-9]{0,3}"),
                   "roku": re.compile(r"[0-9a-f]{32}"), "plex": re.compile(r"[0-9a-f]{24}")}
 URL_WORD = re.compile(rb"[0-9a-z]+")
+# channels.json ids iptv-org files SFW that the owner rules NSFW (Spec 60 D21: a list files FashionTV Secrets "Erotic")
+NSFW_CHANNELS = {"fashiontvsecrets.fr"}
 QUALITY = re.compile(r"\b(?:u?hd|fhd|sd|[48]k|hevc|h\.?26[45]|\d{3,4}[pi]|backup|geo-blocked|not 24/7)\b")
 COUNTRY_CODE = re.compile(r"[A-Za-z]{2}")
 
@@ -83,6 +86,11 @@ def _name_keys(info: dict) -> Iterable[str]:
     for name in [info.get("name")] + list(info.get("alt_names") or []):
         if isinstance(name, str) and (key := name_key(name)):
             yield key
+
+
+def _owner_nsfw(channel: str) -> bool:
+    """Whether the owner rules a channels.json id (or channel@feed) NSFW (NSFW_CHANNELS)."""
+    return channel.split("@")[0].lower() in NSFW_CHANNELS
 
 
 def _to_nsfw(row: dict) -> None:
@@ -157,7 +165,8 @@ class Channels:
                                if isinstance(info.get("country"), str) for name in _name_keys(info))
         self.blocked = {b["channel"].lower(): str(b.get("reason") or "listed") for b in blocklist
                         if isinstance(b, dict) and isinstance(b.get("channel"), str)}
-        self.nsfw_names = {name for info in self.info.values() if self._nsfw(info) for name in _name_keys(info)}
+        self.nsfw_names = {name for info in self.info.values() if self._nsfw(info) or _owner_nsfw(info["id"])
+                           for name in _name_keys(info)}
 
     def _nsfw(self, info: dict) -> bool:
         """Whether iptv-org marks the channel NSFW: is_nsfw, an nsfw blocklist reason, or an NSFW category."""
@@ -200,6 +209,11 @@ class Channels:
         named = [self.info.get(k.split("@")[0].lower()) for k in [row["channel"], *tvg_ids]]
         for info in filter(None, named):
             self._flag(row, info)
+        # The owner's rulings follow the channel's own URLs, not a host+path neighbour: iptv-org's one stream on a
+        # shared SSAI endpoint (ssai.aniview.com, channel in the query) keys 348 other channels to FashionTV Secrets.
+        path_keyed = row["url"] not in self.by_url and _host_path(row["url"]) in self.by_path
+        if any(_owner_nsfw(k) for k in ([] if path_keyed else [row["channel"]]) + list(tvg_ids)):
+            _to_nsfw(row)
         info = named[0]
         if info is None:
             if any(name_key(n) in self.nsfw_names for n in [row["name"], *names]):
