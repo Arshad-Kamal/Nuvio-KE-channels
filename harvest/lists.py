@@ -21,8 +21,8 @@ from dataclasses import dataclass
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from allowlist import IPTV_ORG_API, IPTV_ORG_STREAMS, MAX_DOWNLOAD, has_suffix
-from rules import (DRM, LIST_KINDS, M3U_FILE, NSFW_TEXT, STATIC_SOURCES, Verdict, hidden_credential, nsfw_category,
-                   stricter, token_shaped)
+from rules import (DRM, LIST_KINDS, M3U_FILE, NSFW_NAME, NSFW_TEXT, STATIC_SOURCES, Verdict, hidden_credential,
+                   nsfw_category, stricter, token_shaped)
 
 MAX_GUNZIPPED = MAX_DOWNLOAD  # real lists are far smaller; 8 parallel fetches stay within a few hundred MB
 FETCH_TIMEOUT = 30  # per socket operation
@@ -293,7 +293,8 @@ def _extinf(line: str) -> tuple[dict[str, str], str, str]:
     commas dropped, so a name holding a comma ("CNN, East") stays whole. Before the name stand the duration and
     unquoted attributes, each value running to the next key, stray quotes and separating commas stripped; leading-comma
     lists put them after the duration's comma, and a line with no comma left is read the same way when it starts with
-    one. Leftover = the rest of that part (a mispaired quote's spill, an unknown key), for the NSFW rules (parse_m3u)."""
+    one. Leftover = the rest of that part (a mispaired quote's spill, an unknown key), for the NSFW rules
+    (parse_m3u)."""
     attributes = {k.lower(): v for k, v in EXTINF_ATTRIBUTE.findall(line)}
     rest = DURATION.sub("", EXTINF_ATTRIBUTE.sub("", line[len("#EXTINF:"):]))
     head, comma, name = rest.partition(",")
@@ -345,11 +346,11 @@ def parse_m3u(text: str, source: str) -> Iterator[dict[str, str]]:
     but its URLs (tvg-name, a name an unquoted attribute swallowed; a logo URL's random "7IxXX6f" is not a name), and
     the category rules on the leftover (_extinf). A URL line with no #EXTINF of its own (another URL of the entry
     before) keeps that entry's NSFW signal but not its name or tvg-id (run 15: lists put unrelated backups there)."""
-    extinf, fresh, headers, drm, group, nsfw = "", False, [], False, "", False
+    extinf, headers, drm, group, nsfw = "", [], False, "", False
     for raw in text.splitlines():
         line = raw.strip().lstrip("\ufeff")
         if line.startswith("#EXTINF"):
-            extinf, fresh = line, True
+            extinf = line
         elif line.startswith("#EXTVLCOPT:"):
             option, _, value = line[len("#EXTVLCOPT:"):].partition("=")
             headers.append((option, value))
@@ -360,9 +361,10 @@ def parse_m3u(text: str, source: str) -> Iterator[dict[str, str]]:
         elif line and not line.startswith("#"):
             attributes, name, leftover = _extinf(extinf) if extinf else ({}, "", "")
             categories = (attributes.get("group-title"), group)
-            own = (bool(NSFW_TEXT.search(URL_IN_TEXT.sub(" ", extinf))) or nsfw_category(leftover)
+            own = (bool(NSFW_TEXT.search(URL_IN_TEXT.sub(" ", extinf)))
+                   or bool(NSFW_NAME.search(attributes.get("tvg-name", ""))) or nsfw_category(leftover)
                    or nsfw_category("; ".join(filter(None, categories))))
-            carried = nsfw and not fresh  # another URL of the entry before (its #EXTGRP is not repeated)
+            carried = nsfw and not extinf  # another URL of the entry before (its #EXTGRP is not repeated)
             nsfw = own or carried
             found = _stream_url(line.split()[0])
             if found:
@@ -374,7 +376,7 @@ def parse_m3u(text: str, source: str) -> Iterator[dict[str, str]]:
                           notes="KODIPROP license (DRM)" if drm else "license pair (DRM)" if kodi_drm else "-",
                           tvg_id=attributes.get("tvg-id", ""))
             # nsfw stays for the entry's further URL lines (carried); everything else belongs to this URL.
-            extinf, fresh, headers, drm, group = "", False, [], False, ""
+            extinf, headers, drm, group = "", [], False, ""
 
 
 def _json_category(node: dict) -> str | None:
@@ -406,9 +408,11 @@ def parse_json_list(data: object, source: str) -> Iterator[dict[str, str]]:
             continue
         name = next((node[k] for k in JSON_NAME_KEYS if isinstance(node.get(k), str)), context[0])
         tvg_id = next((node[k] for k in JSON_TVG_ID_KEYS if isinstance(node.get(k), str)), context[2])
-        text = " ".join(v for v in node.values() if isinstance(v, str) and not URL_START.match(v.strip()))
+        text = URL_IN_TEXT.sub(" ", " ".join(v for v in node.values() if isinstance(v, str)))
+        # Flags are scalars only: str() of a nested subtree would cost its whole size on every level.
         nsfw = bool(NSFW_TEXT.search(text)) or any(
-            JSON_ADULT_FLAG.fullmatch(str(k)) and str(v).strip().lower() in ("true", "1", "yes") for k, v in node.items())
+            JSON_ADULT_FLAG.fullmatch(str(k)) and isinstance(v, (str, int))
+            and str(v).strip().lower() in ("true", "1", "yes") for k, v in node.items())
         category = _category((_json_category(node), context[1]), nsfw)
         drm = any(_drm_key(key) for key in node)
         children = []

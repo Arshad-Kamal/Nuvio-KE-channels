@@ -88,15 +88,15 @@ NSFW_URL = re.compile(
     r"\bnsfw\b|drsof1968",
     re.IGNORECASE,
 )
-_NSFW_TERMS = (r"porn|er[o\u00f3]tic|erotik|[e\u00e9]rotique|\bspicy\b|playboy|hustler|brazzers|visit-x|redlight|\bnsfw\b|"
-               r"dorcel|penthouse|vivid ?tv|babes ?tv|babestation|18\+")
+_NSFW_TERMS = (r"porn|er[o\u00f3]tic|erotik|[e\u00e9]rotique|\bspicy\b|playboy|hustler|brazzers|visit-x|redlight|"
+               r"\bnsfw\b|dorcel|penthouse|vivid ?tv|babes ?tv|babestation|18\+|"
+               # Pluto DE's adult group: all 8 channels erotic by Pluto's descriptions; iptv-org flags 4 (D19)
+               r"sinnliche fantasien")
 NSFW_NAME = re.compile(r"xxx|" + _NSFW_TERMS, re.IGNORECASE)
 # The same terms in an entry's other text (attribute values, JSON fields), where random ids live (a YouTube channel
 # "UCXXxRH...", an imgur "7IxXX6f"): there "xxx" must start a word.
 NSFW_TEXT = re.compile(r"(?<![a-z0-9])xxx|" + _NSFW_TERMS, re.IGNORECASE)
-# Whole category tokens. "sinnliche fantasien" is Pluto DE's adult group: all 8 of its channels are erotic by Pluto's own
-# descriptions (Spec 60 D19 audit, review round 6); iptv-org flags only 4 of them.
-NSFW_CATEGORIES = {"xxx", "adult", "erotic", "nsfw", "sinnliche fantasien"}
+NSFW_CATEGORIES = {"xxx", "adult", "erotic", "nsfw"}  # whole category tokens
 ADULT_WORD = re.compile(r"\badult\b(?!\s*swim)", re.IGNORECASE)  # free-text group-titles ("Adult Channels")
 
 DRM_SCHEMES = r"widevine|clearkey|playready|fairplay"
@@ -136,7 +136,8 @@ _IP_VALUE = (r"[?&;][^=&#;?]*=(?:(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?|\[?(?:(?:[0-9a
 # (Rakuten/MediaTailor bitok/eyJ<session>), /expires/<epoch>, DAI pod-serving (/stream/<uuid>) and MediaTailor session
 # paths, Dailymotion sec(...) paths, Wowza session chunklists, Brightcove SSAI session paths (/profile_<n>/<32hex>/).
 _PATH_MARKERS = (r"/[_-]?(?:token|tkn|session|signature)/|/eyJ[\w-]{8,}|/expires?/\d|/stream/[0-9a-f]{8}-[0-9a-f-]{27}|"
-                 r"/v1/manifest/[^/]+/[^/]+/[0-9a-f]{8}-[0-9a-f-]{27}/|/sec\d?\(|chunklist_w\d|/profile_\d+/[0-9a-f]{32}/")
+                 r"/v1/manifest/[^/]+/[^/]+/[0-9a-f]{8}-[0-9a-f-]{27}/|/sec\d?\(|chunklist_w\d|"
+                 r"/profile_\d+/[0-9a-f]{32}/")
 # A hex digest segment, then a number or a sha256 (webcaster.pro free_<hash>/<id>/1080p/<md5>/<expiry>.m3u8; key-bound
 # restreams /live/<32hex>/<channel>.m3u8; interactvty.pro /<32hex>/<64hex>.m3u8, a different hash per list for one
 # stream). Measured 2026-11-07: 3 + 1 public non-exact rows.

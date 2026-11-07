@@ -8,7 +8,8 @@ seeds' stream rows (<private>/seed/research-{public,private,nsfw}.tsv, extract_r
 endpoint that is a list file (lists.list_target), fetched now. Every copy is bucketed by rules.verdict (a row of a
 list the research put in nsfw, or private as a listed pirate list, and a research stream row citing such a list,
 also carries that list's verdict: lists.list_taints), copies are merged by exact URL (rules.merge), then each row
-gets its channel key and the iptv-org blocklist/NSFW joins (channels.py). streams.tsv is the only public output
+gets its channel key and the iptv-org blocklist/NSFW joins, and NSFW spreads to every URL of a FAST channel
+(channels.py). streams.tsv is the only public output
 (D16). Fetching iptv-org's API (streams, channels, blocklist) or a FAST index failing fails the run (exit 1); a
 research list failing is recorded in pulls.tsv. Before anything is written every public row is checked for this
 machine's egress IP (egress.py); a hit or a failed lookup fails the run and nothing is written. A private repo that
@@ -30,7 +31,7 @@ from pathlib import Path
 import egress
 import lists
 from allowlist import REVIEWED_HOSTS, Allowlist, parse_reviewed, stream_urls
-from channels import Channels
+from channels import Channels, spread_nsfw
 from extract_research import COLUMNS, OUT_COLUMNS, SEED_BUCKETS, private_repo, seed_path, tsv, write_all
 from rules import LIST_KINDS, Verdict, merge, stricter, verdict, vouches
 
@@ -143,6 +144,7 @@ def main() -> int:
     for row in kept.values():
         joined.apply(row, row["_tvg_ids"], row["_names"])
         row["seen_in"] = seen_in(row["seen_in"])
+    spread_nsfw(kept.values())
 
     def pick(name: str) -> list[dict]:
         return [row for row in kept.values() if row["_bucket"] == name]

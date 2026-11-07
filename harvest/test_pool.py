@@ -19,7 +19,7 @@ import extract_research
 import lists
 import rules
 from allowlist import Allowlist, parse_reviewed
-from channels import Channels, name_key, provider_id
+from channels import Channels, name_key, provider_id, spread_nsfw
 from extract_research import COLUMNS, OUT_COLUMNS
 from rules import verdict, vouches
 
@@ -425,6 +425,21 @@ class ListsTest(unittest.TestCase):
                                                             "group": "Sinnliche Fantasien"}}}}}
         row = next(lists.fast_rows("pluto", index))
         self.assertEqual(verdict(row, ALLOW).bucket, "nsfw")
+        listed = copy("https://cdn.example.org/a.m3u8", category="Pluto DE: Sinnliche Fantasien")  # free text
+        self.assertEqual(verdict(listed, ALLOW).bucket, "nsfw")
+
+    def test_json_tvg_id_carries_to_children_and_scalar_adult_flags(self):
+        data = {"channel": "Adult.us", "sources": [{"file": "https://cdn.example.org/1.m3u8"}],
+                "more": [{"name": "A", "adult": "yes", "url": "https://cdn.example.org/2.m3u8"},
+                         {"name": "B", "is_nsfw": 1, "url": "https://cdn.example.org/3.m3u8"},
+                         {"name": "C", "adult": {"adult": "true"}, "url": "https://cdn.example.org/4.m3u8"},
+                         {"name": "D", "notes": "https://x.example/p Hustler late night", "url": "https://cdn.example.org/5.m3u8"}]}
+        rows = list(lists.parse_json_list(data, SOURCE))
+        self.assertEqual([r["tvg_id"] for r in rows], ["Adult.us"] * 5)
+        # C: a dict-valued flag is not read (scalars only); the nested {"adult": "true"} marks only its own children
+        self.assertEqual([verdict(r, ALLOW).bucket for r in rows], ["public", "nsfw", "nsfw", "public", "nsfw"])
+        rows = list(lists.parse_m3u('#EXTINF:-1 tvg-name="HotXXX TV",Late\nhttps://cdn.example.org/6.m3u8\n', SOURCE))
+        self.assertEqual(verdict(rows[0], ALLOW).bucket, "nsfw")  # a glued "xxx" in tvg-name
 
     def test_a_json_drm_key_marks_its_own_urls_only(self):
         # run 12 shapes: teleonline's root "license" is its content licence; Zappr's clearkey channel has a non-DRM
@@ -665,6 +680,13 @@ class ChannelsTest(unittest.TestCase):
         row = pool_row("https://other.example/t.m3u8")
         join.apply(row, ["Tab.us"])
         self.assertEqual((row["country"], row["category"], row["_bucket"]), ("U S", "news xxx", "nsfw"))
+
+    def test_nsfw_spreads_to_every_url_of_a_fast_channel_only(self):
+        fast = pool_row(f"https://jmp2.uk/plu-{PLUTO_ID}.m3u8", bucket="nsfw")
+        stitcher = pool_row(f"https://service-stitcher.clusters.pluto.tv/stitch/hls/channel/{PLUTO_ID}/master.m3u8")
+        other = pool_row("https://iptv.example/a.m3u8")
+        spread_nsfw([fast, stitcher, other])
+        self.assertEqual([r["_bucket"] for r in (fast, stitcher, other)], ["nsfw", "nsfw", "public"])
 
     def test_any_copy_name_alt_names_blocklist_nsfw_and_an_empty_key(self):
         join = Channels(STREAMS, CHANNELS + [
