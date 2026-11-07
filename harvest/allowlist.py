@@ -56,9 +56,9 @@ EMBEDDED_URL = re.compile(
     re.IGNORECASE,
 )
 URL_DECODE_LAYERS = 3
-# Three path segments ending in a number: Xtream's short form (no generic deny pattern: official CDNs share the
-# shape, e.g. /hls/KBS/03.m3u8, so those lose host-level admission only).
-SHORT_PANEL_PATH = re.compile(r"/[^/?#]+/[^/?#]+/\d+(?:\.\w+)?")
+# Three path segments (decoded, empty ones dropped) ending in a number: Xtream's short form (no generic deny pattern:
+# official CDNs share the shape, e.g. /hls/KBS/03.m3u8, so those lose host-level admission only).
+SHORT_PANEL_ID = re.compile(r"\d+(?:\.\w+)?")
 HOST_SHAPE = re.compile(r"[a-z0-9.-]+|[0-9a-f:.]+")  # an ASCII name, an IPv4 address or an IPv6 literal
 DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -116,7 +116,8 @@ def tenant(url: str) -> str | None:
     host, netloc, segments = split
     if has_suffix(host, OPEN_HOSTS) or PROXY_LABEL.search(host) or _embeds_url(url):
         return None
-    if SHORT_PANEL_PATH.fullmatch(urlsplit(url.strip()).path):
+    decoded = [unquote(segment) for segment in segments]
+    if len(decoded) == 3 and SHORT_PANEL_ID.fullmatch(decoded[2]):
         return None
     depth = _owner_depth(host)
     if len(segments) < depth:

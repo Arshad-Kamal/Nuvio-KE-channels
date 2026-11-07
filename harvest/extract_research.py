@@ -74,6 +74,14 @@ def tsv(rows: list[dict], columns: list[str] | None = None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def write_all(outputs: dict[Path, str]) -> None:
+    """Writes every output only after all of them encode (an unencodable string fails before the first write)."""
+    encoded = {path: text.encode("utf-8") for path, text in outputs.items()}
+    for path, data in encoded.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Extract the Spec 60 research tables into seed files.")
     parser.add_argument("--streams", type=Path, help="local copy of iptv-org's streams.json (default: download)")
@@ -106,9 +114,7 @@ def main() -> int:
                args.private / "seed" / "research-nsfw.tsv": tsv(pick("nsfw"))}
     if not egress.publish_gate(streams + sources, OUT_COLUMNS):
         return 1
-    for path, text in outputs.items():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
+    write_all(outputs)
     reasons = collections.Counter((r["_bucket"], r["reason"].split(":")[0]) for r in kept.values())
     print(f"rows read {len(pairs)}, unique URLs {len(kept)}: public streams {len(streams)}, public sources "
           f"{len(sources)}, private {len(pick('private'))}, nsfw {len(pick('nsfw'))}; skipped lines {len(skipped)}, "

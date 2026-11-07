@@ -81,15 +81,25 @@ class Fetched:
     body: bytes
 
 
+SURROGATE = re.compile("[\ud800-\udfff]")  # JSON "\ud800" escapes decode to lone surrogates: not encodable as UTF-8
+
+
 def cell(value: object, limit: int = MAX_NAME) -> str:
-    """One TSV cell from untrusted text: whitespace runs (tabs, newlines) collapsed, capped, "-" when empty."""
-    text = " ".join(str(value).split())[:limit]
+    """One TSV cell from untrusted text: whitespace runs (tabs, newlines) collapsed, lone surrogates replaced, capped,
+    "-" when empty."""
+    text = " ".join(SURROGATE.sub("\ufffd", str(value)).split())[:limit]
     return text or "-"
 
 
 def clean_url(text: object) -> str | None:
-    """The URL when it is one whitespace-free token with a scheme and at most MAX_URL characters, else None."""
-    if not isinstance(text, str) or len(text) > MAX_URL or text.split() != [text] or not URL_START.match(text):
+    """The URL when it is one whitespace- and surrogate-free token with a scheme, at most MAX_URL characters, that
+    urlsplit can read (an unbalanced "[" raises there), else None."""
+    if (not isinstance(text, str) or len(text) > MAX_URL or text.split() != [text] or not URL_START.match(text)
+            or SURROGATE.search(text)):
+        return None
+    try:
+        urlsplit(text).port
+    except ValueError:
         return None
     return text
 
@@ -132,6 +142,8 @@ def list_target(row: Mapping[str, str]) -> tuple[str | None, str]:
         url = "https://raw.githubusercontent.com/{}/{}/{}".format(*file.groups())
     elif gist := GIST_PAGE.match(url):
         url = "https://gist.github.com/{}/{}/raw".format(*gist.groups())
+    # One file, one fetch: raw.githubusercontent.com serves <ref> and refs/heads/<ref> alike.
+    url = re.sub(r"^(https://raw\.githubusercontent\.com/[^/]+/[^/]+/)refs/heads/", r"\1", url, flags=re.IGNORECASE)
     try:
         parts = urlsplit(url)
         host, path = (parts.hostname or "").lower(), unquote(parts.path)
@@ -229,19 +241,17 @@ def fetch(url: str) -> Fetched:
 
 # --- parsing ----------------------------------------------------------------------------------------------------
 
+EXTINF_ATTRIBUTE = re.compile(r'([\w-]+)\s*=\s*"([^"]*)"')  # some lists write tvg-logo= "..."
+
+
 def _extinf(line: str) -> tuple[dict[str, str], str]:
-    """Attributes and name of an #EXTINF line; the name follows the first comma outside quotes."""
-    quoted = False
-    for index, char in enumerate(line):
-        if char == '"':
-            quoted = not quoted
-        elif char == "," and not quoted:
-            head, name = line[:index], line[index + 1:]
-            break
-    else:
-        head, name = line, ""
-    attributes = {k.lower(): v for k, v in re.findall(r'([\w-]+)="([^"]*)"', head)}
-    return attributes, name.strip()
+    """Attributes and name of an #EXTINF line. Attributes are read wherever they stand (some lists write
+    '#EXTINF:-1,tvg-id="X",tvg-logo="...",Name'); the name is what follows the duration once they are removed, its
+    leading commas dropped, so a name holding a comma ("CNN, East") stays whole."""
+    attributes = {k.lower(): v for k, v in EXTINF_ATTRIBUTE.findall(line)}
+    rest = EXTINF_ATTRIBUTE.sub("", line[len("#EXTINF:"):])
+    rest = re.sub(r"^\s*-?\d+(?:\.\d+)?", "", rest)  # the duration
+    return attributes, rest.lstrip(" \t,").strip()
 
 
 def _stream_url(token: str) -> tuple[str, list[tuple[str, str]]] | None:
@@ -298,6 +308,7 @@ def parse_json_list(data: object, source: str) -> Iterator[dict[str, str]]:
         for key, value in node.items():
             if isinstance(value, str):
                 found = _stream_url(value.strip()) if value.strip().split() == [value.strip()] else None
+                # clean_url already proved urlsplit reads the URL
                 if (found and JSON_URL_KEY.search(key) and not JSON_NOT_STREAM_KEY.search(key)
                         and urlsplit(found[0]).path.strip("/")):
                     yield row(name, found[0], source, headers=headers_cell(found[1]),

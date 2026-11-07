@@ -29,7 +29,7 @@ import egress
 import lists
 from allowlist import REVIEWED_HOSTS, Allowlist, parse_reviewed, stream_urls
 from channels import Channels
-from extract_research import COLUMNS, OUT_COLUMNS, tsv
+from extract_research import COLUMNS, OUT_COLUMNS, tsv, write_all
 from rules import LIST_KINDS, Verdict, merge, stricter, verdict, vouches
 
 POOL_COLUMNS = OUT_COLUMNS + ["channel"]
@@ -89,12 +89,10 @@ def pull_lists(research_lists: list[dict]) -> tuple[list[dict], list[tuple[list[
     for research in research_lists:
         url, kind = lists.list_target(research)
         if url is not None:
-            taint, old = list_taint(research), taints.get(url, False)
-            if old is not False:
-                taints[url] = old if taint is None else taint if old is None else stricter(old, taint)
+            duplicate = url in taints
+            taints[url] = stricter(taints.get(url), list_taint(research))
+            if duplicate:
                 url, kind = None, "skip:duplicate"
-            else:
-                taints[url] = taint
         targets.append((research, url, kind))
     with concurrent.futures.ThreadPoolExecutor(FETCH_WORKERS) as pool:
         results = list(pool.map(_pull, targets))
@@ -135,7 +133,12 @@ def main() -> int:
         return 1
     allow = Allowlist(iptv_org, parse_reviewed(REVIEWED_HOSTS.read_text(encoding="utf-8")), vouches)
     seeds = research_seeds(args.public, args.private)
-    pulls, pulled = pull_lists([row for row in seeds if row["kind"] in LIST_KINDS])
+    research_lists = [row for row in seeds if row["kind"] in LIST_KINDS]
+    pulls, pulled = pull_lists(research_lists)
+    # A research stream row cites the page it came from: a tainted research list taints it as it taints pulled rows.
+    cited: dict[str, Verdict | None] = {}
+    for research in research_lists:
+        cited[research["url"]] = stricter(cited.get(research["url"]), list_taint(research))
 
     def copies():
         def tagged(rows, where, taint=None):
@@ -143,14 +146,16 @@ def main() -> int:
         yield from tagged(lists.iptv_org_rows(streams), "iptv-org")
         for service, rows in fast.items():
             yield from tagged(rows, f"fast:{service}")
-        yield from tagged(({c: row[c] for c in COLUMNS} for row in seeds if row["kind"] not in LIST_KINDS), "research")
+        for row in seeds:
+            if row["kind"] not in LIST_KINDS:
+                yield from tagged([{c: row[c] for c in COLUMNS}], "research", cited.get(row["source_page"]))
         for number, (rows, taint) in enumerate(pulled):
             yield from tagged(rows, f"list:{number}", taint)
 
     kept = merge(copies())
     joined = Channels(streams, *joins)
     for row in kept.values():
-        joined.apply(row, row["tvg_id"])
+        joined.apply(row, row["_tvg_ids"])
         row["seen_in"] = seen_in(row["seen_in"])
 
     def pick(name: str) -> list[dict]:
@@ -163,9 +168,7 @@ def main() -> int:
                args.private / "pool" / "private.tsv": tsv(pick("private"), POOL_COLUMNS),
                args.private / "pool" / "nsfw.tsv": tsv(pick("nsfw"), POOL_COLUMNS),
                args.private / "pool" / "pulls.tsv": tsv(pulls, PULL_COLUMNS)}
-    for path, text in outputs.items():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
+    write_all(outputs)
     report(kept, pulls, fast)
     return 0
 

@@ -105,11 +105,13 @@ NOT_DRM = re.compile(r"(?<!not )(?<!n't )(?<!n\u2019t )(?<!longer )(?<!never )\b
 #    stitcher's ads.ip=<requester>: minted for whoever built the list), path-token markers, DAI pod-serving (/stream/<uuid>) and MediaTailor session paths,
 #    Dailymotion sec(...) paths, Wowza session chunklists, an epoch+hash pair (e=<epoch>&h=), JWTs anywhere.
 TOKEN_URL = re.compile(
-    r"[?&;/~](?:hdnts|hdnea|hdntl|__hdnea__|[a-z_.-]*token|tkn|wmsauthsign|wowzatoken\w*|jwt|auth|auth_key|policy|"
+    r"[?&;/~](?:hdnts|hdnea|hdntl|__hdnea__|[a-z0-9_.-]*token[a-z0-9_]*|tkn|wmsauthsign|wowzatoken\w*|jwt|auth|auth_key|policy|"
     r"signature|key-pair-id|expires|exp|sig|sign|md5|hash|hmac|acl|validto|nva|nvb|sid|session|[a-z_.]*sessionid|"
     r"_lsu_sa_|x-amz-[a-z-]+|[a-z_.-]*api[-_]?key|__token__|ws(?:secret|time)|tx(?:secret|time)|__gda__|ec_secure|st|secure|"
     r"nonce|[a-z_.]*streaming_?id)=|[?&]e=\d{9,}&h=|[?&]h=[0-9a-f]+&e=\d{9,}|"
-    r"[?&;][^=&#]*=(?:\d{1,3}\.){3}\d{1,3}(?=[&#;]|$)|"  # a query value that is an IPv4 address (ads.ip=<viewer>)
+    # a query value that is an IP address, IPv4 (with a port) or IPv6 (ads.ip=<viewer>)
+    r"[?&;][^=&#]*=(?:(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?|\[?(?:(?:[0-9a-f]{1,4}:){4,7}[0-9a-f]{1,4}|[0-9a-f:]*::[0-9a-f:]*)\]?)"
+    r"(?=[&#;]|$)|"
     r"/(?:token|tkn|session|signature)/|/expires?/\d|/stream/[0-9a-f]{8}-[0-9a-f-]{27}|"
     r"/v1/manifest/[^/]+/[^/]+/[0-9a-f]{8}-[0-9a-f-]{27}/|/sec\d?\(|chunklist_w\d|eyJ[\w-]{8,}\.eyJ",
     re.IGNORECASE,
@@ -128,9 +130,10 @@ STATIC_SOURCES = (
     "raw.githubusercontent.com", "gist.githubusercontent.com", "github.com", "gist.github.com", "api.github.com",
     "github.io", "gitlab.com", "gitlab.io", "bitbucket.org", "codeberg.org", "cdn.jsdelivr.net", "pastebin.com",
     "pastecode.dev", "i.mjh.nz",
-    # D14 (Arshad 2026-11-07): list files on web hosts, byte-identical on refetch.
-    "www.apsattv.com", "www.tdtchannels.com", "m3u.cl",
 )
+# D14 (Arshad 2026-11-07): M3U list files on these web hosts, byte-identical on refetch, are static; nothing else there.
+STATIC_M3U_HOSTS = ("www.apsattv.com", "www.tdtchannels.com", "m3u.cl")
+M3U_FILE = re.compile(r"\.m3u8?$", re.IGNORECASE)
 REDIRECT_PATH = re.compile(r"^/\.r/")  # i.mjh.nz/.r/<slug> answers each requester with a fresh redirect
 
 SCHEME = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
@@ -243,6 +246,8 @@ def _static_source(row: Mapping[str, str]) -> bool:
         return False
     host, _, segments = split
     path = unquote("/" + "/".join(segments))  # %2Er is the same redirector as .r
+    if host in STATIC_M3U_HOSTS:
+        return bool(M3U_FILE.search(path))
     return has_suffix(host, STATIC_SOURCES) and not REDIRECT_PATH.match(path)
 
 
@@ -273,14 +278,15 @@ def verdict(row: Mapping[str, str], allow: Allowlist) -> Verdict:
     listed = _listed_source(row["source_page"])
     if listed:
         return Verdict("private", f"listed:{listed}", copy_only=True)
-    # The other published cells: a credential or token written into headers, a source page or a stream's notes is
-    # published too. A list's notes describe its contents ("contains :25461 entries"), and a directly recorded row's
-    # source is its URL, judged above and by the exact-iptv-org exemption.
-    columns = ("headers",) + (("notes",) if stream else ()) + (("source_page",) if row["source_page"] != url else ())
+    # Every other published cell: a credential or token written into any of them is published too. A list's notes
+    # describe its contents ("contains :25461 entries"), and a directly recorded row's source is its URL, judged above
+    # and by the exact-iptv-org exemption.
+    columns = ("name", "country", "language", "category", "format", "headers", "geo_hint") + (
+        ("notes",) if stream else ()) + (("source_page",) if row["source_page"] != url else ())
     for column in columns:
-        if _hidden_credential(row[column]):
+        if _hidden_credential(row.get(column, "-")):
             return Verdict("private", "credential", copy_only=True)
-        if _token_shaped(row[column]):
+        if _token_shaped(row.get(column, "-")):
             return Verdict("private", "minted", copy_only=True)
     if stream and not listed_by_iptv_org and not _static_source(row):
         return Verdict("private", "minted", copy_only=True)
@@ -297,19 +303,21 @@ def _severity(verdict: Verdict) -> int:
     return {"nsfw": 3, "public": 0}.get(verdict.bucket, 1 if verdict.copy_only else 2)
 
 
-def stricter(found: Verdict, taint: Verdict | None) -> Verdict:
-    """The stricter of a copy's own verdict and the taint of the list it came from. Within one copy any fault counts
-    (nsfw > private for the stream > private for this copy > public); across copies merge() ranks instead."""
-    return taint if taint is not None and _severity(taint) > _severity(found) else found
+def stricter(first: Verdict | None, second: Verdict | None) -> Verdict | None:
+    """The stricter of two verdicts for one copy (None = no verdict). Within one copy any fault counts (nsfw > private
+    for the stream > private for this copy > public); across copies merge() ranks instead."""
+    if first is None or (second is not None and _severity(second) > _severity(first)):
+        return second
+    return first
 
 
 def merge(copies: Iterable[tuple[Mapping[str, str], str, Verdict]]) -> dict[str, dict]:
     """Dedupes (row, origin, verdict) copies by exact URL. The highest-ranked verdict wins (rank()) and its copy's cells
-    are kept; the first copy wins a tie. seen_in lists every distinct origin, first seen first; tvg_id is the first
-    non-empty one of any copy."""
+    are kept; the first copy wins a tie. seen_in lists every distinct origin, first seen first; _tvg_ids lists every
+    distinct non-empty tvg_id of any copy, first seen first."""
     kept: dict[str, dict] = {}
     seen: dict[str, dict[str, None]] = {}
-    tvg_ids: dict[str, str] = {}
+    tvg_ids: dict[str, dict[str, None]] = {}
     for row, where, found in copies:
         url = row["url"]
         old = kept.get(url)
@@ -317,8 +325,8 @@ def merge(copies: Iterable[tuple[Mapping[str, str], str, Verdict]]) -> dict[str,
             kept[url] = {**row, "reason": found.reason, "_bucket": found.bucket, "_rank": rank(found)}
         seen.setdefault(url, {})[where] = None
         if row.get("tvg_id"):
-            tvg_ids.setdefault(url, row["tvg_id"])
+            tvg_ids.setdefault(url, {})[row["tvg_id"]] = None
     for url, row in kept.items():
         row["seen_in"] = ",".join(seen[url])
-        row["tvg_id"] = tvg_ids.get(url, "")
+        row["_tvg_ids"] = list(tvg_ids.get(url, {}))
     return kept

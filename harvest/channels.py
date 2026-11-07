@@ -44,7 +44,7 @@ def provider_id(url: str) -> str | None:
     if (host == "pluto.tv" or host.endswith(".pluto.tv")) and (channel := PLUTO_PATH.search(path)):
         return f"pluto:{channel[1].lower()}"
     if host == "i.mjh.nz" and path.startswith("/.r/") and len(path) > 4:
-        return "mjh:" + re.sub(r"\.m3u8$", "", path[4:].lower())
+        return cell("mjh:" + re.sub(r"\.m3u8$", "", path[4:].lower()), 100)  # the decoded path is untrusted text
     return None
 
 
@@ -75,8 +75,9 @@ class Channels:
         listed = [(s["url"], s["channel"], s.get("feed")) for s in streams
                   if isinstance(s, dict) and isinstance(s.get("url"), str) and isinstance(s.get("channel"), str)]
         self.by_url = {url: cell(f"{channel}@{feed}" if feed else channel, 100) for url, channel, feed in listed}
-        self.by_path = _unique((_host_path(url), channel) for url, channel, _ in listed if _host_path(url))
-        self.by_provider = _unique((provider_id(url), channel) for url, channel, _ in listed if provider_id(url))
+        paths = [(_host_path(url), provider_id(url), channel) for url, channel, _ in listed]
+        self.by_path = _unique((path, channel) for path, _, channel in paths if path)
+        self.by_provider = _unique((provider, channel) for _, provider, channel in paths if provider)
         self.by_name = _unique(((info["country"].upper(), name_key(name)), info["id"])
                                for info in self.info.values() if isinstance(info.get("country"), str)
                                for name in [info.get("name")] + list(info.get("alt_names") or [])
@@ -110,11 +111,12 @@ class Channels:
         elif blocked and row["_bucket"] == "public":
             row["_bucket"], row["reason"] = "private", cell(f"blocklist:{blocked}")
 
-    def apply(self, row: dict, tvg_id: str) -> None:
-        """Sets row["channel"]; a blocklisted or NSFW channel (by key or by a copy's tvg-id) moves the row out of
-        public (NSFW out of private too); empty country and category cells are filled from channels.json."""
-        row["channel"] = self.key(row, tvg_id)
-        named = [self.info.get(k.split("@")[0].lower()) for k in (row["channel"], tvg_id)]
+    def apply(self, row: dict, tvg_ids: list[str]) -> None:
+        """Sets row["channel"] (keyed by the first tvg-id); a blocklisted or NSFW channel, named by the key or by any
+        copy's tvg-id, moves the row out of public (NSFW out of private too); empty country and category cells are
+        filled from channels.json."""
+        row["channel"] = self.key(row, tvg_ids[0] if tvg_ids else "")
+        named = [self.info.get(k.split("@")[0].lower()) for k in [row["channel"], *tvg_ids]]
         for info in filter(None, named):
             self._flag(row, info)
         info = named[0]

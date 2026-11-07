@@ -14,6 +14,7 @@ from unittest import mock
 
 import build_pool
 import egress
+import extract_research
 import lists
 import rules
 from allowlist import Allowlist, parse_reviewed
@@ -333,6 +334,51 @@ class RoundOneTest(unittest.TestCase):
         self.assertEqual(lists.headers_cell([("Referer", " "), ("User-Agent", "UA")]), '{"User-Agent":"UA"}')
 
 
+class RoundTwoTest(unittest.TestCase):
+    """Fixes from H1b red-team review round 2 (Spec 60)."""
+
+    def test_unreadable_urls_and_lone_surrogates_do_not_abort_a_run(self):
+        data = [{"name": "Bad", "url": "http://[x/a.m3u8"}, {"name": "S\ud800", "url": "https://a.example/s.m3u8"},
+                {"name": "T", "url": "https://a.example/\ud800.m3u8"}]
+        rows = list(lists.parse_json_list(data, SOURCE))
+        self.assertEqual([(r["name"], r["url"]) for r in rows], [("S\ufffd", "https://a.example/s.m3u8")])
+        with tempfile.TemporaryDirectory() as d:
+            good, bad = Path(d) / "a.tsv", Path(d) / "b.tsv"
+            with self.assertRaises(UnicodeEncodeError):
+                extract_research.write_all({good: "fine", bad: "x\ud800"})
+            self.assertFalse(good.exists())
+
+    def test_leading_comma_extinf_keeps_attributes_out_of_the_name(self):
+        rows = list(lists.parse_m3u('#EXTINF:-1,tvg-id="X.us",tvg-logo="https://l.example/x.png",X News\n'
+                                    "https://x.example/x.m3u8\n", SOURCE))
+        self.assertEqual((rows[0]["name"], rows[0]["tvg_id"]), ("X News", "X.us"))
+        rows = list(lists.parse_m3u('#EXTINF:-1 tvg-logo= "https://l.example/y.png" , Y TV | HD\nhttps://y.example/y\n',
+                                    SOURCE))
+        self.assertEqual(rows[0]["name"], "Y TV | HD")
+
+    def test_every_published_cell_is_scanned(self):
+        for cells in ({"name": "X ?token=abc"}, {"category": "http://u:p@198.51.100.5/"}, {"language": "?sig=1"}):
+            self.assertEqual(verdict(copy("https://cdn.example.org/a.m3u8", **cells), ALLOW).copy_only, True, cells)
+
+    def test_d14_hosts_are_static_for_m3u_files_only(self):
+        url = "https://cdn.example.org/live/c.m3u8"
+        self.assertEqual(verdict(copy(url, "https://www.apsattv.com/xumo.m3u"), ALLOW).bucket, "public")
+        self.assertEqual(verdict(copy(url, "https://www.apsattv.com/api/live.json"), ALLOW),
+                         rules.Verdict("private", "minted", True))
+
+    def test_more_requester_values_and_token_keys(self):
+        for query in ("ads.ip=2a02:1:2:3:4:5:6:7", "ip=2001:db8::1", "ip=203.0.113.9:8080", "token_id=1", "v2token=1"):
+            self.assertEqual(verdict(copy(f"https://cdn.example.org/a.m3u8?{query}"), ALLOW).reason, "minted", query)
+        self.assertEqual(verdict(copy("https://cdn.example.org/a.m3u8?start=12:30:45"), ALLOW).bucket, "public")
+
+    def test_short_form_variants_and_refs_heads_duplicates(self):
+        allow = Allowlist(["http://198.51.100.7:826/a/b/1"], parse_reviewed(""), vouches)
+        for path in ("//u/p/120160", "/u/p/%31%32"):
+            self.assertIsNone(allow.admit(f"http://198.51.100.7:826{path}"), path)
+        self.assertEqual(lists.list_target(research("https://raw.githubusercontent.com/o/r/refs/heads/main/a.m3u")),
+                         ("https://raw.githubusercontent.com/o/r/main/a.m3u", "static"))
+
+
 STREAMS = [
     {"url": "https://iptv.example/a.m3u8", "channel": "CNN.us", "feed": "East"},
     {"url": "https://iptv.example/live/b.m3u8?token=1", "channel": "BBC.uk", "feed": None},
@@ -380,20 +426,20 @@ class ChannelsTest(unittest.TestCase):
 
     def test_blocklist_nsfw_and_fills(self):
         blocked = pool_row("https://pirate.example/f.m3u8", name="Futbol Max", country="ES")
-        self.join.apply(blocked, "")
+        self.join.apply(blocked, [])
         self.assertEqual((blocked["_bucket"], blocked["reason"], blocked["category"]),
                          ("private", "blocklist:dmca", "sports"))
         adult = pool_row("https://x.example/l.m3u8", bucket="private")
-        self.join.apply(adult, "Adult.us")
+        self.join.apply(adult, ["Adult.us"])
         self.assertEqual((adult["_bucket"], adult["reason"], adult["country"]), ("nsfw", "nsfw", "US"))
 
     def test_a_copy_tvg_id_naming_an_nsfw_channel_counts_and_fills_are_cleaned(self):
         exact = pool_row("https://iptv.example/a.m3u8")  # resolves to CNN.us@East by exact URL
-        self.join.apply(exact, "Adult.us")
+        self.join.apply(exact, ["CNN.us", "Adult.us"])
         self.assertEqual(exact["_bucket"], "nsfw")
         join = Channels(STREAMS, [{"id": "Tab.us", "name": "Tab", "country": "U\tS", "categories": ["news\nxxx"]}], [])
         row = pool_row("https://other.example/t.m3u8")
-        join.apply(row, "Tab.us")
+        join.apply(row, ["Tab.us"])
         self.assertEqual((row["country"], row["category"], row["_bucket"]), ("U S", "news xxx", "nsfw"))
 
     def test_helpers(self):
@@ -486,6 +532,11 @@ class BuildPoolTest(unittest.TestCase):
         self.assertEqual(self.buckets(self.seeds(listed), body)["https://iptv.example/live/x.m3u8"], "private.tsv")
         self.assertEqual(self.buckets(self.seeds(research(SOURCE, bucket="public", reason="reviewed-host")), body)
                          ["https://iptv.example/live/x.m3u8"], "streams.tsv")
+
+    def test_a_research_stream_citing_an_nsfw_research_list_is_nsfw(self):
+        seeds = self.seeds(research(SOURCE, bucket="nsfw", reason="nsfw"))
+        seeds["research-streams.tsv"][0]["source_page"] = SOURCE
+        self.assertEqual(self.buckets(seeds, "")["https://iptv.example/r.m3u8"], "nsfw.tsv")
 
     def test_a_duplicate_target_keeps_the_strictest_taint(self):
         blob = research("https://github.com/someone/lists/blob/main/all.m3u", bucket="public", reason="reviewed-host")
