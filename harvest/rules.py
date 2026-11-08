@@ -24,7 +24,7 @@ import binascii
 import functools
 import json
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from typing import NamedTuple
 from urllib.parse import SplitResult, unquote, urlsplit
 
@@ -239,6 +239,11 @@ def url_rejection(url: str) -> tuple[str, str] | None:
     """(bucket, reason) when the URL alone rules a row out (NSFW, scheme, credential, listed host), else None."""
     if NSFW_URL.search(url):
         return "nsfw", "nsfw"
+    return url_fault(url)
+
+
+def url_fault(url: str) -> tuple[str, str] | None:
+    """url_rejection's private reasons: scheme, credential, listed host."""
     if not SCHEME.match(url):
         return "private", "no-scheme"
     if not re.match(r"https?://", url, re.IGNORECASE):
@@ -330,23 +335,42 @@ def verdict(row: Mapping[str, str], allow: Allowlist) -> Verdict:
     if NSFW_NAME.search(row["name"]) or nsfw_category(row["category"]) or NSFW_URL.search(row["source_page"]):
         return Verdict("nsfw", "nsfw")
     url = row["url"]
-    rejected = url_rejection(url)
-    if rejected:
-        return Verdict(*rejected)
-    stream = row["kind"] not in LIST_KINDS
+    if NSFW_URL.search(url):
+        return Verdict("nsfw", "nsfw")
     # iptv-org published this exact string, so it was not minted for our fetches alone.
     listed_by_iptv_org = url in allow.urls
+    fault = next(private_faults(row, listed_by_iptv_org), None)
+    if fault:
+        return fault
+    criterion = allow.admit(url)
+    if criterion is None:
+        return Verdict("private", "unreviewed-host")
+    if not listed_by_iptv_org and has_parameters(url):
+        return Verdict("private", "unreviewed-query")
+    return Verdict("public", criterion)
+
+
+def private_faults(row: Mapping[str, str], listed_by_iptv_org: bool) -> Iterator[Verdict]:
+    """Every private fault of one copy that verdict checks between NSFW and the allowlist, in verdict's order (it takes
+    the first). The channel monitor reads them all: a merged row's reason names only one, so an nsfw or drm reason hides
+    a listed source or a minted provenance (Spec 71 M1.2 round 2, D7). Checks about the stream itself come before
+    checks about this copy."""
+    url = row["url"]
+    rejected = url_fault(url)
+    if rejected:
+        yield Verdict(*rejected)
+    stream = row["kind"] not in LIST_KINDS
     # DRM is a property of the stream itself; for a list endpoint the notes describe its contents.
     parts = _urlsplit_or_none(url)
     if stream and (DRM.search(row["format"]) or DRM.search(NOT_DRM.sub("", row["name"]))
                    or DRM.search(NOT_DRM.sub("", row["notes"]))
                    or (not listed_by_iptv_org and DRM_PATH.search(parts.path if parts else url))):
-        return Verdict("private", "drm")
+        yield Verdict("private", "drm")
     if not listed_by_iptv_org and (token_shaped(url) or (stream and MINTED_NOTES.search(row["notes"]))):
-        return Verdict("private", "minted")
+        yield Verdict("private", "minted")
     listed = _listed_source(row["source_page"])
     if listed:
-        return Verdict("private", f"listed:{listed}", copy_only=True)
+        yield Verdict("private", f"listed:{listed}", copy_only=True)
     # Every other published cell: a credential or token written into any of them is published too. A list's notes
     # describe its contents ("contains :25461 entries"), and a directly recorded row's source is its URL, judged above
     # and by the exact-iptv-org exemption.
@@ -354,17 +378,11 @@ def verdict(row: Mapping[str, str], allow: Allowlist) -> Verdict:
         ("notes",) if stream else ()) + (("source_page",) if row["source_page"] != url else ())
     for column in columns:
         if hidden_credential(row.get(column, "-")):
-            return Verdict("private", "credential", copy_only=True)
+            yield Verdict("private", "credential", copy_only=True)
         if token_shaped(row.get(column, "-")):
-            return Verdict("private", "minted", copy_only=True)
+            yield Verdict("private", "minted", copy_only=True)
     if stream and not listed_by_iptv_org and not _static_source(row):
-        return Verdict("private", "minted", copy_only=True)
-    criterion = allow.admit(url)
-    if criterion is None:
-        return Verdict("private", "unreviewed-host")
-    if not listed_by_iptv_org and has_parameters(url):
-        return Verdict("private", "unreviewed-query")
-    return Verdict("public", criterion)
+        yield Verdict("private", "minted", copy_only=True)
 
 
 def bucket(row: Mapping[str, str], allow: Allowlist) -> tuple[str, str]:

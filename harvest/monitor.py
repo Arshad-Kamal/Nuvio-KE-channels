@@ -9,10 +9,10 @@ it reads the pool and writes only monitor/state.tsv (url, state, since, class, s
 server sent is written: cells are enums, dates and slot bits, every URL must be an in-scope pool URL, and a run that
 breaks any of that writes nothing (exit 1). Output is aggregate counts, never a URL.
 
-Scope (Spec 71 D2), judged by the URL, not only the reason (rules.verdict stops at NSFW, so an nsfw row's reason hides a
-credential or a token): http(s) only; no credential, minted, non-http or listed reason (a listed host or list is
-rules.py's only defence against Xtream's short-form credential URLs: D17); no YouTube host; no credential in the URL or
-headers (D17); no minted URL, headers or notes unless iptv-org lists the URL.
+Scope (Spec 71 D2, D7, D8): http(s) only, no YouTube host, and no credential, minted, non-http or listed fault, read
+from every fault rules.private_faults finds in the row, not only from its reason (a merged row's reason names one:
+nsfw or drm hides a listed source or a minted provenance). A listed host or list is rules.py's only defence against
+Xtream's short-form credential URLs (D17, D8).
 
 FAST rows (D1): a jmp2.uk or i.mjh.nz URL naming a Pluto/Samsung/Roku/Plex channel is judged by its service's index
 (listed / unlisted), plus a sample of US rows probed each run (fast_results); it is never probed in the ring.
@@ -57,7 +57,7 @@ import lists
 from allowlist import has_suffix
 from channels import provider_id
 from extract_research import private_repo
-from rules import MINTED_NOTES, hidden_credential, token_shaped
+from rules import private_faults
 
 USER_AGENT = "Nuvio-KE-channels monitor (+https://github.com/Arshad-Kamal/Nuvio-KE-channels)"
 SOCKET_TIMEOUT = 10  # per socket operation
@@ -83,7 +83,7 @@ STATE_FILE = Path("monitor") / "state.tsv"
 CURSOR_FILE = Path("monitor") / "cursor"
 KEY_LENGTH = 16
 
-SKIP_REASONS = ("credential", "minted", "non-http", "listed")
+SKIP_REASONS = ("credential", "minted", "non-http", "no-scheme", "listed")
 YOUTUBE_HOSTS = ("youtube.com", "youtu.be")
 FAST_HOSTS = ("jmp2.uk", "i.mjh.nz")
 FAST_SERVICES = tuple(lists.FAST_INDEXES)
@@ -165,18 +165,14 @@ def _headers(cell: str) -> tuple[tuple[str, str], ...]:
                  if name in SEND_HEADERS and isinstance(value, str) and HEADER_VALUE.fullmatch(value))
 
 
-def _minted(row: dict[str, str]) -> bool:
-    """rules.verdict's minted rules for what a probe sends (URL, headers) and the notes; verdict never reaches them for
-    nsfw or drm rows. Token-shaped headers are minted even beside an iptv-org URL, as in verdict's cell checks."""
-    listed_by_iptv_org = "iptv-org" in row["seen_in"].split(",")
-    return token_shaped(row["headers"]) or (
-        not listed_by_iptv_org and (token_shaped(row["url"]) or bool(MINTED_NOTES.search(row["notes"]))))
+def _skipped(reason: str) -> bool:
+    return reason.split(":")[0] in SKIP_REASONS
 
 
 def scoped(row: dict[str, str]) -> Row | None:
     """The Row to monitor, or None when the pool row is out of scope (module docstring)."""
     url = row["url"]
-    if row["reason"].split(":")[0] in SKIP_REASONS or not re.match(r"https?://", url, re.IGNORECASE):
+    if _skipped(row["reason"]) or not re.match(r"https?://", url, re.IGNORECASE):
         return None
     try:
         parts = urlsplit(url)
@@ -184,8 +180,9 @@ def scoped(row: dict[str, str]) -> Row | None:
         parts.port  # noqa: B018  (raises on a bad port)
     except ValueError:
         return None
-    if (not host or has_suffix(host, YOUTUBE_HOSTS) or hidden_credential(url) or hidden_credential(row["headers"])
-            or _minted(row)):
+    listed_by_iptv_org = "iptv-org" in row["seen_in"].split(",")  # the merged row holds iptv-org's copy
+    if not host or has_suffix(host, YOUTUBE_HOSTS) or any(
+            _skipped(fault.reason) for fault in private_faults(row, listed_by_iptv_org)):
         return None
     pid = provider_id(url)
     service = pid.split(":")[0] if pid else None

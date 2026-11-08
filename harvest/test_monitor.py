@@ -27,6 +27,7 @@ import monitor
 from monitor import MonitorError, Record, Row, step
 
 PLUTO_ID = "5ca671f215a62078d2ec0abf"
+STATIC_LIST = "https://raw.githubusercontent.com/someone/lists/main/all.m3u"  # a static source: nothing minted
 TS = (b"\x47" + b"\x00" * 187) * 4
 MEDIA = b"#EXTM3U\n#EXT-X-TARGETDURATION:6\n" + b"".join(b"#EXTINF:6,\nseg%d.ts\n" % i for i in range(1, 5))
 HLS = "application/vnd.apple.mpegurl"
@@ -516,7 +517,7 @@ class StepTest(unittest.TestCase):
 class ScopeTest(unittest.TestCase):
     def pool_row(self, url: str, **cells) -> dict:
         return {**{c: "-" for c in build_pool.POOL_COLUMNS}, "url": url, "reason": "nsfw", "seen_in": "lists:1",
-                **cells}
+                "kind": "stream", "source_page": STATIC_LIST, **cells}
 
     def test_credentials_minted_and_other_schemes_are_never_probed(self):
         for url, cells in [("http://panel.example:8080/live/u1/p1/1.ts", {}),
@@ -532,6 +533,13 @@ class ScopeTest(unittest.TestCase):
                            ("rtmp://cdn.example/live", {"reason": "unreviewed-host"}),
                            ("https://www.youtube.com/watch?v=x", {"reason": "unreviewed-host"})]:
             self.assertIsNone(monitor.scoped(self.pool_row(url, **cells)), (url, cells))
+
+    def test_faults_behind_an_nsfw_or_drm_reason_still_skip(self):
+        listed_list = "https://raw.githubusercontent.com/zokerpunk/tv/main/all.m3u"
+        self.assertIsNone(monitor.scoped(self.pool_row("https://cdn.example/a.m3u8", source_page=listed_list)))
+        self.assertIsNone(monitor.scoped(self.pool_row("https://cdn.example/a.m3u8", reason="drm",
+                                                       source_page="https://broadcaster.example/api/live")))
+        self.assertIsNotNone(monitor.scoped(self.pool_row("https://cdn.example/a.m3u8", reason="drm")))
 
     def test_a_token_url_iptv_org_lists_is_probed(self):
         found = monitor.scoped(self.pool_row("https://cdn.example/live.m3u8?token=abc", reason="iptv-org-url",
