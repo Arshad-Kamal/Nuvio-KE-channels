@@ -15,7 +15,7 @@ string (`?...`), `;` parameters or a Kodi `|` suffix is published only when iptv
 - `pool/streams.tsv`: the candidate pool (not yet checked): iptv-org's streams, the FAST services (Pluto TV,
   Samsung TV Plus, Roku, Plex) and every list the research found, one row per URL. `channel` groups the URLs of one
   channel (an iptv-org channel id, or `<service>:<id>` for a FAST channel iptv-org lacks); `headers` is a JSON object
-  of the Referer / User-Agent / Origin a stream needs (free text on rows that came from research). Built by
+  of the Referer / User-Agent / Origin a stream needs (research notes that are not such headers stay in `notes`). Built by
   `python3 harvest/build_pool.py <this repo> <private repo>`.
 - `harvest/`: the scripts that build the candidate pool. Tests: `python3 -m unittest discover -s harvest`.
 - `harvest/reviewed-hosts.txt`: hosts reviewed for publication.

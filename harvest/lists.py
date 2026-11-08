@@ -2,17 +2,19 @@
 
 Every function returns candidate rows in extract_research.COLUMNS shape (plus "tvg_id"); bucketing happens in
 build_pool.py. Remote content is untrusted: cells are single-line and length-capped, a URL holding whitespace or
-over MAX_URL is skipped, fetches only reach public addresses over http(s), and each response is capped in size and
-time. The headers cell is a compact ASCII JSON object of Referer / User-Agent / Origin (a User-Agent holds "; ", so
-a delimited list could not be split back), or "-".
+over MAX_URL is skipped, fetches only reach public addresses over http(s), and each fetch is capped in size and in
+wall-clock time. The headers cell is a compact ASCII JSON object of Referer / User-Agent / Origin (a User-Agent holds
+"; ", so a delimited list could not be split back), or "-".
 """
 import gzip
 import http.client
 import io
 import ipaddress
 import json
+import queue
 import re
 import socket
+import threading
 import time
 import urllib.request
 import zlib
@@ -26,7 +28,7 @@ from rules import (DRM, LIST_KINDS, M3U_FILE, NSFW_NAME, NSFW_TEXT, STATIC_SOURC
 
 MAX_GUNZIPPED = MAX_DOWNLOAD  # real lists are far smaller; 8 parallel fetches stay within a few hundred MB
 FETCH_TIMEOUT = 30  # per socket operation
-FETCH_DEADLINE = 120  # whole response
+FETCH_DEADLINE = 120  # whole fetch: connect, TLS, redirects, headers, body
 USER_AGENT = "Nuvio-KE-channels harvest (+https://github.com/Arshad-Kamal/Nuvio-KE-channels)"
 MAX_NAME = 200
 MAX_URL = 4096
@@ -62,6 +64,14 @@ JSON_ADULT_FLAG = re.compile(r"(?:is_?)?(?:nsfw|adult)", re.IGNORECASE)  # fullm
 HEADER_NAMES = {"http-referrer": "Referer", "http-user-agent": "User-Agent", "http-origin": "Origin",
                 "referer": "Referer", "referrer": "Referer", "user-agent": "User-Agent", "origin": "Origin"}
 MAX_HEADER = 1000
+# Research free text naming request headers ("UA: Mozilla/5.0 (...)", "Referer https://x/; Origin https://x",
+# "Origin=...|Referer=...|UA=..."): a key starts the text or follows a separator; its value runs to the next key.
+HEADER_TEXT_KEY = re.compile(r"(?:^|[;|,])\s*(user-agent|ua|referr?er|origin)\b\s*[:=]?\s*", re.IGNORECASE)
+HEADER_TEXT_NAMES = {"ua": "User-Agent", "user-agent": "User-Agent", "referer": "Referer", "referrer": "Referer",
+                     "origin": "Origin"}
+UA_PRODUCT = re.compile(r"[A-Za-z][\w.+-]*/\d")  # a real User-Agent names a product/version ("UA=UA" does not)
+UA_NOTE = re.compile(r"\s+(?:\([^;/()]*\)|via\s.*)$", re.IGNORECASE)  # "otg/1.5.1 (see above)", "... via EXTVLCOPT"
+NO_HEADERS = re.compile(r"(?:none|-)(?:\s+(?:listed|seen|observed|in file))?", re.IGNORECASE)
 
 # Research list endpoints that are list files (Spec 60 H1b plan). iptv-org's own playlists hold nothing streams.json
 # lacks (measured 2026-11-07: 15,552 URLs, 0 outside it); the i.mjh.nz indexes are read as FAST_INDEXES; API
@@ -121,6 +131,33 @@ def headers_cell(pairs: list[tuple[str, str]]) -> str:
             if value:
                 found.setdefault(canonical, value)
     return json.dumps(found, separators=(",", ":")) if found else "-"
+
+
+def headers_from_text(text: str) -> tuple[str, bool]:
+    """(headers cell, whole) from research free text naming request headers (HEADER_TEXT_KEY): a Referer/Origin value
+    is its first token when that is an http(s) URL, a User-Agent value the text up to the next key when it names a
+    product/version, a trailing note dropped. whole is False when any part of the text was not read so (text before
+    the first key, a placeholder such as "UA=UA", a note, "Authorization Bearer"): the caller keeps the text."""
+    text = " ".join(text.split())
+    if NO_HEADERS.fullmatch(text):
+        return "-", True
+    keys = list(HEADER_TEXT_KEY.finditer(text))
+    whole = bool(keys) and keys[0].start() == 0
+    pairs = []
+    for key, end in zip(keys, [k.start() for k in keys[1:]] + [len(text)]):
+        name, value = HEADER_TEXT_NAMES[key[1].lower()], text[key.end():end].strip(" ;|,")
+        if name == "User-Agent":
+            ua = UA_NOTE.sub("", value)
+            whole = whole and ua == value and bool(UA_PRODUCT.match(ua))
+            if UA_PRODUCT.match(ua):
+                pairs.append((name, ua))
+            continue
+        first, _, rest = value.partition(" ")
+        url = clean_url(first.rstrip(";|,"))
+        whole = whole and url is not None and not rest and re.match(r"https?://", url, re.IGNORECASE) is not None
+        if url and re.match(r"https?://", url, re.IGNORECASE):
+            pairs.append((name, url))
+    return headers_cell(pairs), whole
 
 
 def row(name: str, url: str, source: str, **cells: str) -> dict[str, str]:
@@ -243,7 +280,29 @@ def _encoded(url: str) -> str:
 
 
 def fetch(url: str) -> Fetched:
-    """GETs one URL within the size and time caps; a gzip body is decompressed."""
+    """GETs one URL within the size cap and FETCH_DEADLINE; a gzip body is decompressed. Socket timeouts apply per
+    operation, so a server dripping its TLS handshake or headers could hold one attempt far longer: the attempt runs in a
+    daemon thread and the caller stops waiting at the deadline (the thread then ends on its own timeouts, and stops
+    reading a body at the deadline)."""
+    results: queue.SimpleQueue = queue.SimpleQueue()
+
+    def attempt() -> None:
+        try:
+            results.put(_fetch(url))
+        except Exception as error:  # relayed and raised in the caller's thread, as if fetched there
+            results.put(error)
+
+    threading.Thread(target=attempt, daemon=True).start()
+    try:
+        result = results.get(timeout=FETCH_DEADLINE)
+    except queue.Empty:
+        raise FetchError(f"over {FETCH_DEADLINE} s") from None
+    if isinstance(result, Exception):
+        raise result
+    return result
+
+
+def _fetch(url: str) -> Fetched:
     _public_host(url)
     try:
         request = urllib.request.Request(_encoded(url),

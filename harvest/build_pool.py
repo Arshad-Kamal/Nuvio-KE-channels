@@ -4,8 +4,10 @@
 Usage: build_pool.py <public-repo> <private-repo>
 
 Inputs, in merge order: iptv-org's streams.json; the i.mjh.nz FAST indexes (lists.FAST_INDEXES); the research
-seeds' stream rows (<private>/seed/research-{public,private,nsfw}.tsv, extract_research.py); every research list
-endpoint that is a list file (lists.list_target), fetched now. Every copy is bucketed by rules.verdict (a row of a
+seeds' stream rows (<private>/seed/research-{public,private,nsfw}.tsv, extract_research.py; their free-text headers
+read by lists.headers_from_text, text not read so kept in notes); every research list endpoint that is a list file
+(lists.list_target), fetched now, a list that fails to pull keeping the rows its last good pull gave (pulls.tsv says
+"carried"; Spec 71 M1.1: the rows and their monitor history survive the list's outage). Every copy is bucketed by rules.verdict (a row of a
 list the research put in nsfw, or private as a listed pirate list, and a research stream row citing such a list,
 also carries that list's verdict: lists.list_taints), copies are merged by exact URL (rules.merge), then each row
 gets its channel key and the iptv-org blocklist/NSFW joins, and NSFW spreads to every URL holding a FAST channel id
@@ -25,6 +27,7 @@ import collections
 import concurrent.futures
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import egress
@@ -40,8 +43,20 @@ IPTV_ORG_JOINS = ("channels.json", "blocklist.json")
 FETCH_WORKERS = 8
 
 
+@dataclass
+class Previous:
+    """What the last run wrote: pull records by research URL, and the pool rows of the lists it pulled by source page."""
+    records: dict[str, dict[str, str]]
+    rows: dict[str, list[dict[str, str]]]
+
+
+def pool_files(public: Path, private: Path) -> dict[str, Path]:
+    return {"public": public / "pool" / "streams.tsv", "private": private / "pool" / "private.tsv",
+            "nsfw": private / "pool" / "nsfw.tsv", "pulls": private / "pool" / "pulls.tsv"}
+
+
 def read_tsv(path: Path) -> list[dict[str, str]]:
-    """Rows of a seed file written by extract_research (header line, tab-separated, verbatim)."""
+    """Rows of a file written by extract_research.tsv (header line, tab-separated, verbatim)."""
     lines = path.read_text(encoding="utf-8").split("\n")
     header = lines[0].split("\t")
     return [dict(zip(header, line.split("\t"))) for line in lines[1:] if line]
@@ -72,11 +87,39 @@ def _pull(target: tuple[dict, str | None, str]) -> tuple[dict, list[dict[str, st
     return record, rows
 
 
-def pull_lists(research_lists: list[dict], taints: dict[str, Verdict | None]) \
+def previous_run(public: Path, private: Path) -> Previous:
+    """The last run's outputs (Previous); empty before the first run."""
+    files = pool_files(public, private)
+    records = {r["url"]: r for r in read_tsv(files["pulls"])} if files["pulls"].exists() else {}
+    sources = {r["fetched"] for r in records.values() if r["rows"] != "0" and r["fetched"] != "-"}
+    rows: dict[str, list[dict[str, str]]] = collections.defaultdict(list)
+    for name in ("public", "private", "nsfw"):
+        if files[name].exists():
+            for row in read_tsv(files[name]):
+                if row["source_page"] in sources:
+                    rows[row["source_page"]].append(row)
+    return Previous(records, dict(rows))
+
+
+def carry(record: dict, rows: list[dict[str, str]], previous: Previous) -> tuple[dict, list[dict[str, str]]]:
+    """A list that failed to pull keeps the rows its last good pull gave: those whose source page is the URL that pull
+    fetched (a row another source won stays through that source). They are re-judged like fresh rows; the old channel
+    key is not carried (it may be a host+path guess the joins no longer make)."""
+    last = previous.records.get(record["url"])
+    if not record["status"].startswith("error") or last is None or last["fetched"] == "-":
+        return record, rows
+    kept = [{**{c: r[c] for c in COLUMNS}, "tvg_id": ""} for r in previous.rows.get(last["fetched"], [])]
+    if not kept:
+        return record, rows
+    return {**record, "fetched": last["fetched"], "status": lists.cell(f"carried: {record['status']}"),
+            "rows": str(len(kept))}, kept
+
+
+def pull_lists(research_lists: list[dict], taints: dict[str, Verdict | None], previous: Previous) \
         -> tuple[list[dict], list[tuple[list[dict[str, str]], Verdict | None]]]:
-    """pulls.tsv rows (one per research row, in research order) and, per fetched list, its rows and taint (taints:
-    lists.list_taints of the same rows). Research rows naming the same file are fetched once; the taint is already
-    the strictest of all of them."""
+    """pulls.tsv rows (one per research row, in research order) and, per fetched list, its rows (or the rows carried
+    from the last run when it failed) and taint (taints: lists.list_taints of the same rows). Research rows naming the
+    same file are fetched once; the taint is already the strictest of all of them."""
     targets, fetching = [], set()
     for research in research_lists:
         url, kind = lists.list_target(research)
@@ -86,7 +129,7 @@ def pull_lists(research_lists: list[dict], taints: dict[str, Verdict | None]) \
             fetching.add(url)
         targets.append((research, url, kind))
     with concurrent.futures.ThreadPoolExecutor(FETCH_WORKERS) as pool:
-        results = list(pool.map(_pull, targets))
+        results = [carry(record, rows, previous) for record, rows in pool.map(_pull, targets)]
     pulled = [(rows, taints.get(url)) for (_, url, _), (_, rows) in zip(targets, results) if url is not None]
     return [record for record, _ in results], pulled
 
@@ -94,6 +137,18 @@ def pull_lists(research_lists: list[dict], taints: dict[str, Verdict | None]) \
 def research_seeds(private: Path) -> list[dict[str, str]]:
     """Every research seed row, its bucket (the file it is in) under "_bucket"."""
     return [{**row, "_bucket": name} for name in SEED_BUCKETS for row in read_tsv(seed_path(private, name))]
+
+
+def research_row(seed: dict[str, str]) -> dict[str, str]:
+    """A research seed stream row as a pool copy: free-text headers read into the headers cell; text not read so is
+    kept in notes ("headers: ...")."""
+    row = {c: seed[c] for c in COLUMNS}
+    if row["headers"] not in ("", "-") and not row["headers"].startswith("{"):
+        headers, whole = lists.headers_from_text(row["headers"])
+        if not whole:
+            row["notes"] = "; ".join(n for n in (row["notes"], f"headers: {row['headers']}") if n not in ("", "-"))
+        row["headers"] = headers
+    return row
 
 
 def seen_in(origins: str) -> str:
@@ -124,7 +179,7 @@ def main() -> int:
     seeds = research_seeds(args.private)
     research_lists = [row for row in seeds if row["kind"] in LIST_KINDS]
     taints = lists.list_taints(research_lists)
-    pulls, pulled = pull_lists(research_lists, taints)
+    pulls, pulled = pull_lists(research_lists, taints, previous_run(args.public, args.private))
 
     def copies():
         def tagged(rows, where, taint=None):
@@ -134,7 +189,7 @@ def main() -> int:
             yield from tagged(rows, f"fast:{service}")
         for row in seeds:
             if row["kind"] not in LIST_KINDS:
-                yield from tagged([{c: row[c] for c in COLUMNS}], "research", lists.cited_taint(taints, row))
+                yield from tagged([research_row(row)], "research", lists.cited_taint(taints, row))
         for number, (rows, taint) in enumerate(pulled):
             yield from tagged(rows, f"list:{number}", taint)
 
@@ -151,10 +206,9 @@ def main() -> int:
     public = pick("public")
     if not egress.publish_gate(public, POOL_COLUMNS):
         return 1
-    outputs = {args.public / "pool" / "streams.tsv": tsv(public, POOL_COLUMNS),
-               args.private / "pool" / "private.tsv": tsv(pick("private"), POOL_COLUMNS),
-               args.private / "pool" / "nsfw.tsv": tsv(pick("nsfw"), POOL_COLUMNS),
-               args.private / "pool" / "pulls.tsv": tsv(pulls, PULL_COLUMNS)}
+    files = pool_files(args.public, args.private)
+    outputs = {files["public"]: tsv(public, POOL_COLUMNS), files["private"]: tsv(pick("private"), POOL_COLUMNS),
+               files["nsfw"]: tsv(pick("nsfw"), POOL_COLUMNS), files["pulls"]: tsv(pulls, PULL_COLUMNS)}
     write_all(outputs)
     report(kept, pulls, fast, spread)
     return 0

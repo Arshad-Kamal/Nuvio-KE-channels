@@ -2,7 +2,9 @@
 
 Rows stay one per exact URL; the channel column groups alternates of one channel, keyed in the Spec 60 W3 dedupe order
 after the exact URL: the iptv-org channel[@feed] of the exact URL; the iptv-org channel of the same host+path (any
-query) when only one channel uses it; a FAST provider id (mapped to the iptv-org channel that uses the same id when only
+query) when only one channel uses it and none of iptv-org's URLs on it carries a query (a query can name the channel:
+one ssai.aniview.com path serves every channel by ?AVS_SSAIID=, and keyed 348 others to FashionTV Secrets; Spec 71
+M1.1); a FAST provider id (mapped to the iptv-org channel that uses the same id when only
 one does, else "<service>:<id>"); a tvg-id naming a channels.json id; a name + 2-letter country naming exactly one
 channels.json channel; else empty. A row whose channel key or tvg-id names a channel iptv-org blocklists or marks NSFW
 (Channels._nsfw) moves bucket, as does one the owner rules NSFW (NSFW_CHANNELS: by the channel's own key or a tvg-id,
@@ -159,7 +161,9 @@ class Channels:
                   if isinstance(s, dict) and isinstance(s.get("url"), str) and isinstance(s.get("channel"), str)]
         self.by_url = {url: cell(f"{channel}@{feed}", 100) if feed else channel for url, channel, feed in listed}
         paths = [(_host_path(url), provider_id(url), channel) for url, channel, _ in listed]
-        self.by_path = _unique((path, channel) for path, _, channel in paths if path)
+        queried = {path for (url, _, _), (path, _, _) in zip(listed, paths) if path and urlsplit(url).query}
+        self.by_path = {path: channel for path, channel in _unique((path, channel) for path, _, channel in paths
+                                                                   if path).items() if path not in queried}
         self.by_provider = _unique((provider, channel) for _, provider, channel in paths if provider)
         self.by_name = _unique(((info["country"].upper(), name), info["id"]) for info in self.info.values()
                                if isinstance(info.get("country"), str) for name in _name_keys(info))
@@ -209,8 +213,8 @@ class Channels:
         named = [self.info.get(k.split("@")[0].lower()) for k in [row["channel"], *tvg_ids]]
         for info in filter(None, named):
             self._flag(row, info)
-        # The owner's rulings follow the channel's own URLs, not a host+path neighbour: iptv-org's one stream on a
-        # shared SSAI endpoint (ssai.aniview.com, channel in the query) keys 348 other channels to FashionTV Secrets.
+        # The owner's rulings follow the channel's own URLs, never a host+path neighbour (by_path is a guess: a shared
+        # endpoint names the channel elsewhere).
         path_keyed = row["url"] not in self.by_url and _host_path(row["url"]) in self.by_path
         if any(_owner_nsfw(k) for k in ([] if path_keyed else [row["channel"]]) + list(tvg_ids)):
             _to_nsfw(row)

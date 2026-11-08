@@ -2,6 +2,7 @@
 Run: python3 -m unittest discover -s harvest
 """
 import base64
+import contextlib
 import io
 import json
 import socket
@@ -305,6 +306,33 @@ class ListsTest(unittest.TestCase):
                                                               return_value=FakeResponse([b"x"] * 50)), \
                 mock.patch.object(lists.time, "monotonic", side_effect=lambda: next(clock)):
             with self.assertRaisesRegex(lists.FetchError, "over 120 s"):
+                lists.fetch("https://lists.example/a.m3u")
+
+    def test_research_header_text(self):
+        cases = {
+            "UA: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/1": ('{"User-Agent":"Mozilla/5.0 (Windows NT 10.0; '
+                                                                  'Win64; x64) Chrome/1"}', True),
+            "Origin=https://o.example|Referer=https://o.example/|UA=VLC/3.0 LibVLC":
+                ('{"Origin":"https://o.example","Referer":"https://o.example/","User-Agent":"VLC/3.0 LibVLC"}', True),
+            "User-Agent=Mozilla/5.0 Chrome/134;Referer=https://d.example/":
+                ('{"User-Agent":"Mozilla/5.0 Chrome/134","Referer":"https://d.example/"}', True),
+            "Referer https://t.example/; Authorization Bearer (per-channel)": ('{"Referer":"https://t.example/"}', False),
+            "UA otg/1.5.1 (see above)": ('{"User-Agent":"otg/1.5.1"}', False),
+            "UA=UA": ("-", False), "UA Chrome": ("-", False), "some UA=UA": ("-", False),
+            "X-Plex-Token required": ("-", False), "Referer ftp://f.example/": ("-", False),
+            "none listed": ("-", True)}
+        for text, expected in cases.items():
+            self.assertEqual(lists.headers_from_text(text), expected, text)
+
+    def test_a_fetch_that_never_answers_ends_at_the_deadline(self):
+        hang = mock.patch.object(lists._OPENER, "open", side_effect=lambda *a, **k: time.sleep(5))
+        with resolving_to("93.184.216.34"), hang, mock.patch.object(lists, "FETCH_DEADLINE", 0.2):
+            started = time.monotonic()
+            with self.assertRaisesRegex(lists.FetchError, "over 0.2 s"):
+                lists.fetch("https://lists.example/a.m3u")
+        self.assertLess(time.monotonic() - started, 2)
+        with resolving_to("93.184.216.34"), mock.patch.object(lists._OPENER, "open", side_effect=KeyError("bug")):
+            with self.assertRaises(KeyError):  # an unexpected error surfaces as itself, not as a timeout
                 lists.fetch("https://lists.example/a.m3u")
 
     def test_empty_header_values_are_dropped(self):
@@ -664,7 +692,8 @@ class ChannelsTest(unittest.TestCase):
 
     def test_key_order(self):
         self.assertEqual(self.key("https://iptv.example/a.m3u8", "BBC.uk"), "CNN.us@East")  # exact URL first
-        self.assertEqual(self.key("https://iptv.example/live/b.m3u8?token=2"), "BBC.uk")  # host+path
+        # host+path: never where iptv-org's own URL on the path has a query (it may name the channel)
+        self.assertEqual(self.key("https://iptv.example/live/b.m3u8?token=2"), "")
         self.assertEqual(self.key("https://shared.example/play.php?id=3"), "")  # host+path used by two channels
         self.assertEqual(self.key(f"https://stitcher.pluto.tv/v1/stitch/hls/channel/{PLUTO_ID}/master.m3u8"),
                          "PlutoNews.us")  # provider id mapped
@@ -675,6 +704,13 @@ class ChannelsTest(unittest.TestCase):
         self.assertEqual(self.key("https://other.example/y.m3u8", name="BBC 1", country="INT"), "")
         self.assertEqual(self.key("https://other.example/z.m3u8", name="Twin", country="DE"), "")  # ambiguous name
         self.assertEqual(self.key("http://198.51.100.1:8001/live/x.m3u8"), "")  # another port is another host
+
+    def test_host_path_keys_only_paths_iptv_org_lists_without_a_query(self):
+        join = Channels([{"url": "https://fast.example/live/c.m3u8", "channel": "CNN.us"},
+                         {"url": "https://ssai.example/s.m3u8?id=1", "channel": "BBC.uk"}], CHANNELS, [])
+        self.assertEqual(join.key(pool_row("https://fast.example/live/c.m3u8?ads.app=1"), ""), "CNN.us")
+        for url in ("https://ssai.example/s.m3u8?id=2", "https://ssai.example/s.m3u8"):
+            self.assertEqual(join.key(pool_row(url), ""), "", url)
 
     def test_blocklist_nsfw_and_fills(self):
         blocked = pool_row("https://pirate.example/f.m3u8", name="Futbol Max", country="ES")
@@ -753,7 +789,7 @@ class ChannelsTest(unittest.TestCase):
         self.assertEqual([(r["_bucket"], r["reason"]) for r in (exact, copied, named)], [("nsfw", "nsfw")] * 3)
         neighbour = pool_row("https://ssai.example/s.m3u8?id=2", name="Kids TV")  # another channel on the endpoint
         join.apply(neighbour, [])
-        self.assertEqual((neighbour["channel"], neighbour["_bucket"]), ("FashionTVSecrets.fr", "public"))
+        self.assertEqual((neighbour["channel"], neighbour["_bucket"]), ("", "public"))  # no host+path key there
 
     def test_an_unidentified_row_named_like_an_nsfw_channel_is_nsfw(self):
         # D19 audit (run 13): Pluto DE erotic channels whose provider ids iptv-org maps to nothing
@@ -785,7 +821,7 @@ class ChannelsTest(unittest.TestCase):
             self.assertIsNone(fast_id(url), url)
 
     def test_iptv_org_channel_strings_are_cleaned_and_a_later_tvg_id_keys_the_row(self):
-        streams = [{"url": "https://p.example/live/a.m3u8?t=1", "channel": "Tab\t.us"},
+        streams = [{"url": "https://p.example/live/a.m3u8", "channel": "Tab\t.us"},
                    {"url": f"https://jmp2.uk/plu-{PLUTO_ID}.m3u8", "channel": "New\nline.us"}]
         join = Channels(streams, CHANNELS, [])
         self.assertEqual(join.key(pool_row("https://p.example/live/a.m3u8?t=2"), ""), "Tab .us")
@@ -800,14 +836,15 @@ TEST_IP = "203.0.113.7"
 
 
 class BuildPoolTest(unittest.TestCase):
-    def run_main(self, remote: dict[str, bytes], seeds: dict[str, list[dict]], ips=(TEST_IP,)):
-        """Runs main with fetches answered from `remote`; returns (exit code, files written)."""
+    def run_main(self, remote: dict[str, bytes], seeds: dict[str, list[dict]], ips=(TEST_IP,), where=None):
+        """Runs main with fetches answered from `remote`, in `where` (kept: a later run sees this one's outputs) or a
+        fresh directory; returns (exit code, files written)."""
         def fetch(url):
             if url not in remote:
                 raise lists.FetchError("HTTP Error 404: Not Found")
             return lists.Fetched(url, url, remote[url])
 
-        with tempfile.TemporaryDirectory() as d:
+        with (tempfile.TemporaryDirectory() if where is None else contextlib.nullcontext(where)) as d:
             private = Path(d) / "priv"
             for bucket, rows in seeds.items():
                 path = extract_research.seed_path(private, bucket)
@@ -901,6 +938,29 @@ class BuildPoolTest(unittest.TestCase):
         with mock.patch.object(lists, "fetch", side_effect=lambda u: lists.Fetched(u, moved, b"#EXTINF:-1,X\nhttps://x/a")):
             record, rows = build_pool._pull((research(SOURCE), SOURCE, "static"))
         self.assertEqual((record["fetched"], rows[0]["source_page"]), (moved, moved))
+
+    def test_research_free_text_headers_become_json_and_the_rest_stays_in_notes(self):
+        seeds = self.seeds()
+        seeds["public"][0]["headers"] = "Referer https://t.example/; Authorization Bearer (per-channel)"
+        code, written = self.run_main(self.remote(), seeds)
+        row = next(dict(zip(OUT_COLUMNS + ["channel"], line.split("\t"))) for line in written["streams.tsv"].splitlines()
+                   if "/r.m3u8\t" in line)
+        self.assertEqual((row["headers"], row["notes"]), ('{"Referer":"https://t.example/"}',
+                                                          "headers: Referer https://t.example/; Authorization Bearer (per-channel)"))
+
+    def test_a_list_that_fails_keeps_its_last_rows(self):
+        m3u = "#EXTINF:-1,Unknown\nhttps://unreviewed.example/u.m3u8\n"
+        seeds = self.seeds(research(SOURCE), research("https://never.example/l.m3u"))
+        with tempfile.TemporaryDirectory() as d:
+            first, _ = self.run_main(self.remote(m3u=m3u), seeds, where=d)
+            code, written = self.run_main(self.remote(), seeds, where=d)  # SOURCE now fails
+            again, rewritten = self.run_main(self.remote(), seeds, where=d)  # and fails again
+        self.assertEqual((first, code, again), (0, 0, 0))
+        for files in (written, rewritten):
+            self.assertIn("https://unreviewed.example/u.m3u8\t", files["private.tsv"])
+            pulls = [line.split("\t") for line in files["pulls.tsv"].splitlines()[1:]]
+            self.assertEqual([(p[1], p[3].split(":")[0], p[4]) for p in pulls],
+                             [(SOURCE, "carried", "1"), ("https://never.example/l.m3u", "error", "0")])
 
     def test_a_failed_required_source_fails_before_writing(self):
         remote = self.remote()
