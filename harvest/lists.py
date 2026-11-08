@@ -69,7 +69,10 @@ MAX_HEADER = 1000
 HEADER_TEXT_KEY = re.compile(r"(?:^|[;|,])\s*(user-agent|ua|referr?er|origin)\b\s*[:=]?\s*", re.IGNORECASE)
 HEADER_TEXT_NAMES = {"ua": "User-Agent", "user-agent": "User-Agent", "referer": "Referer", "referrer": "Referer",
                      "origin": "Origin"}
-UA_PRODUCT = re.compile(r"[A-Za-z][\w.+-]*/\d")  # a real User-Agent names a product/version ("UA=UA" does not)
+# A User-Agent reads as product[/version] tokens and (comments) only, starting with a product/version ("UA=UA", "UA
+# Chrome" do not); trailing text such as "; Cookie: s=1" fails it, so another header is never published inside it.
+UA_VALUE = re.compile(r"[A-Za-z][\w.+-]*+/[\w.+-]++(?:\s++(?:[\w.+-]++(?:/[\w.+-]++)?+|\([^()]*+\)))*+")
+HTTP_URL = re.compile(r"https?://", re.IGNORECASE)
 UA_NOTE = re.compile(r"\s+(?:\([^;/()]*\)|via\s.*)$", re.IGNORECASE)  # "otg/1.5.1 (see above)", "... via EXTVLCOPT"
 NO_HEADERS = re.compile(r"(?:none|-)(?:\s+(?:listed|seen|observed|in file))?", re.IGNORECASE)
 
@@ -134,30 +137,32 @@ def headers_cell(pairs: list[tuple[str, str]]) -> str:
 
 
 def headers_from_text(text: str) -> tuple[str, bool]:
-    """(headers cell, whole) from research free text naming request headers (HEADER_TEXT_KEY): a Referer/Origin value
-    is its first token when that is an http(s) URL, a User-Agent value the text up to the next key when it names a
-    product/version, a trailing note dropped. whole is False when any part of the text was not read so (text before
-    the first key, a placeholder such as "UA=UA", a note, "Authorization Bearer"): the caller keeps the text."""
+    """(headers cell, whole) from research free text naming request headers (HEADER_TEXT_KEY; values: _header_value).
+    whole is False when any part of the text was not read so (text before the first key, a placeholder such as "UA=UA",
+    a note, "Authorization Bearer", a repeated or over-long value): the caller keeps the text."""
     text = " ".join(text.split())
     if NO_HEADERS.fullmatch(text):
         return "-", True
     keys = list(HEADER_TEXT_KEY.finditer(text))
     whole = bool(keys) and keys[0].start() == 0
-    pairs = []
+    found: dict[str, str] = {}
     for key, end in zip(keys, [k.start() for k in keys[1:]] + [len(text)]):
         name, value = HEADER_TEXT_NAMES[key[1].lower()], text[key.end():end].strip(" ;|,")
-        if name == "User-Agent":
-            ua = UA_NOTE.sub("", value)
-            whole = whole and ua == value and bool(UA_PRODUCT.match(ua))
-            if UA_PRODUCT.match(ua):
-                pairs.append((name, ua))
-            continue
-        first, _, rest = value.partition(" ")
-        url = clean_url(first.rstrip(";|,"))
-        whole = whole and url is not None and not rest and re.match(r"https?://", url, re.IGNORECASE) is not None
-        if url and re.match(r"https?://", url, re.IGNORECASE):
-            pairs.append((name, url))
-    return headers_cell(pairs), whole
+        read = _header_value(name, value)
+        whole = whole and read == value and name not in found and len(value) <= MAX_HEADER
+        if read:
+            found.setdefault(name, read)
+    return headers_cell(list(found.items())), whole
+
+
+def _header_value(name: str, value: str) -> str | None:
+    """A User-Agent: the value without a trailing note when it reads as product tokens and comments (UA_VALUE); a
+    Referer/Origin: its first token when that is an http(s) URL; else None."""
+    if name == "User-Agent":
+        ua = UA_NOTE.sub("", value)
+        return ua if UA_VALUE.fullmatch(ua) else None
+    url = clean_url(value.split(" ")[0].rstrip(";|,"))
+    return url if url and HTTP_URL.match(url) else None
 
 
 def row(name: str, url: str, source: str, **cells: str) -> dict[str, str]:
@@ -282,13 +287,15 @@ def _encoded(url: str) -> str:
 def fetch(url: str) -> Fetched:
     """GETs one URL within the size cap and FETCH_DEADLINE; a gzip body is decompressed. Socket timeouts apply per
     operation, so a server dripping its TLS handshake or headers could hold one attempt far longer: the attempt runs in a
-    daemon thread and the caller stops waiting at the deadline (the thread then ends on its own timeouts, and stops
-    reading a body at the deadline)."""
+    daemon thread and the caller stops waiting at the deadline. The abandoned thread stops reading a body at the same
+    deadline; one stuck before the body lives until a socket operation times out or the server stops (a daemon, it
+    never holds the process)."""
+    deadline = time.monotonic() + FETCH_DEADLINE
     results: queue.SimpleQueue = queue.SimpleQueue()
 
     def attempt() -> None:
         try:
-            results.put(_fetch(url))
+            results.put(_fetch(url, deadline))
         except Exception as error:  # relayed and raised in the caller's thread, as if fetched there
             results.put(error)
 
@@ -302,14 +309,13 @@ def fetch(url: str) -> Fetched:
     return result
 
 
-def _fetch(url: str) -> Fetched:
+def _fetch(url: str, deadline: float) -> Fetched:
     _public_host(url)
     try:
         request = urllib.request.Request(_encoded(url),
                                          headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"})
     except ValueError as error:
         raise FetchError(f"bad URL: {error}") from error
-    deadline = time.monotonic() + FETCH_DEADLINE
     chunks, size = [], 0
     try:
         with _OPENER.open(request, timeout=FETCH_TIMEOUT) as response:

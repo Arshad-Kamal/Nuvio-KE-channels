@@ -320,6 +320,11 @@ class ListsTest(unittest.TestCase):
             "UA otg/1.5.1 (see above)": ('{"User-Agent":"otg/1.5.1"}', False),
             "UA=UA": ("-", False), "UA Chrome": ("-", False), "some UA=UA": ("-", False),
             "X-Plex-Token required": ("-", False), "Referer ftp://f.example/": ("-", False),
+            "UA=Mozilla/5.0; Cookie: s=abc": ("-", False), "UA Mozilla/5.0 |Authorization=Bearer x": ("-", False),
+            "UA: Mozilla/5.0 (X11; rv:93.0) Gecko/20100101 Firefox/93.0":
+                ('{"User-Agent":"Mozilla/5.0 (X11; rv:93.0) Gecko/20100101 Firefox/93.0"}', True),
+            "Referer https://a.example/; Referer https://b.example/": ('{"Referer":"https://a.example/"}', False),
+            "UA x/" + "1" * 1200: ('{"User-Agent":"x/' + "1" * 998 + '"}', False),
             "none listed": ("-", True)}
         for text, expected in cases.items():
             self.assertEqual(lists.headers_from_text(text), expected, text)
@@ -711,6 +716,10 @@ class ChannelsTest(unittest.TestCase):
         self.assertEqual(join.key(pool_row("https://fast.example/live/c.m3u8?ads.app=1"), ""), "CNN.us")
         for url in ("https://ssai.example/s.m3u8?id=2", "https://ssai.example/s.m3u8"):
             self.assertEqual(join.key(pool_row(url), ""), "", url)
+        adult = Channels([{"url": "https://ssai.example/a.m3u8?id=1", "channel": "Adult.us"}], CHANNELS, [])
+        row = pool_row("https://ssai.example/a.m3u8")  # not keyed there, but the path's NSFW channel still flags it
+        adult.apply(row, [])
+        self.assertEqual((row["channel"], row["_bucket"]), ("", "nsfw"))
 
     def test_blocklist_nsfw_and_fills(self):
         blocked = pool_row("https://pirate.example/f.m3u8", name="Futbol Max", country="ES")
@@ -949,18 +958,29 @@ class BuildPoolTest(unittest.TestCase):
                                                           "headers: Referer https://t.example/; Authorization Bearer (per-channel)"))
 
     def test_a_list_that_fails_keeps_its_last_rows(self):
-        m3u = "#EXTINF:-1,Unknown\nhttps://unreviewed.example/u.m3u8\n"
-        seeds = self.seeds(research(SOURCE), research("https://never.example/l.m3u"))
+        m3u = ("#EXTINF:-1,Unknown\nhttps://unreviewed.example/u.m3u8\n"
+               '#EXTINF:-1 tvg-id="Adult.us",Neutral\nhttps://iptv.example/live/n.m3u8\n'  # nsfw by tvg-id
+               '#EXTINF:-1 tvg-id="Blocked.es",Plain\nhttps://iptv.example/live/p.m3u8\n')  # blocklisted by tvg-id alone
+        seeds = self.seeds(research(SOURCE, bucket="public", reason="reviewed-host"),
+                           research("https://never.example/l.m3u"))
+        cited = {**seeds, "public": [{**seeds["public"][0], "source_page": SOURCE}] + seeds["public"][1:]}
         with tempfile.TemporaryDirectory() as d:
-            first, _ = self.run_main(self.remote(m3u=m3u), seeds, where=d)
+            first, before = self.run_main(self.remote(m3u=m3u), cited, where=d)
+            seeds["public"][0]["url"] = "https://iptv.example/r2.m3u8"  # the research row citing SOURCE is gone
             code, written = self.run_main(self.remote(), seeds, where=d)  # SOURCE now fails
             again, rewritten = self.run_main(self.remote(), seeds, where=d)  # and fails again
         self.assertEqual((first, code, again), (0, 0, 0))
+        self.assertIn("https://iptv.example/r.m3u8\t", before["streams.tsv"])
         for files in (written, rewritten):
             self.assertIn("https://unreviewed.example/u.m3u8\t", files["private.tsv"])
+            self.assertIn("https://iptv.example/live/n.m3u8\t", files["nsfw.tsv"])  # never less strict when carried
+            self.assertIn("https://iptv.example/live/p.m3u8\t", files["private.tsv"])
+            urls = {line.split("\t")[1] for name in ("streams.tsv", "private.tsv", "nsfw.tsv")
+                    for line in files[name].splitlines()[1:]}
+            self.assertNotIn("https://iptv.example/r.m3u8", urls)  # a research row citing the list is not carried
             pulls = [line.split("\t") for line in files["pulls.tsv"].splitlines()[1:]]
             self.assertEqual([(p[1], p[3].split(":")[0], p[4]) for p in pulls],
-                             [(SOURCE, "carried", "1"), ("https://never.example/l.m3u", "error", "0")])
+                             [(SOURCE, "carried", "3"), ("https://never.example/l.m3u", "error", "0")])
 
     def test_a_failed_required_source_fails_before_writing(self):
         remote = self.remote()

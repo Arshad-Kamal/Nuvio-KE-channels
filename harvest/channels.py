@@ -160,11 +160,13 @@ class Channels:
         listed = [(s["url"], cell(s["channel"], 100), s.get("feed")) for s in streams
                   if isinstance(s, dict) and isinstance(s.get("url"), str) and isinstance(s.get("channel"), str)]
         self.by_url = {url: cell(f"{channel}@{feed}", 100) if feed else channel for url, channel, feed in listed}
-        paths = [(_host_path(url), provider_id(url), channel) for url, channel, _ in listed]
-        queried = {path for (url, _, _), (path, _, _) in zip(listed, paths) if path and urlsplit(url).query}
-        self.by_path = {path: channel for path, channel in _unique((path, channel) for path, _, channel in paths
-                                                                   if path).items() if path not in queried}
-        self.by_provider = _unique((provider, channel) for _, provider, channel in paths if provider)
+        paths = [(url, _host_path(url), provider_id(url), channel) for url, channel, _ in listed]
+        # path_neighbour: the one iptv-org channel on a host+path; it keys a row only where no iptv-org URL on the path
+        # has a query (by_path), but its NSFW/blocklist flags reach every row on the path (apply).
+        self.path_neighbour = _unique((path, channel) for _, path, _, channel in paths if path)
+        queried = {path for url, path, _, _ in paths if path and urlsplit(url).query}
+        self.by_path = {path: channel for path, channel in self.path_neighbour.items() if path not in queried}
+        self.by_provider = _unique((provider, channel) for _, _, provider, channel in paths if provider)
         self.by_name = _unique(((info["country"].upper(), name), info["id"]) for info in self.info.values()
                                if isinstance(info.get("country"), str) for name in _name_keys(info))
         self.blocked = {b["channel"].lower(): str(b.get("reason") or "listed") for b in blocklist
@@ -206,12 +208,14 @@ class Channels:
 
     def apply(self, row: dict, tvg_ids: list[str], names: Iterable[str] = ()) -> None:
         """Sets row["channel"] (keyed by the first copy's tvg-id that names a channels.json id); a blocklisted or NSFW
-        channel, named by the key or by any copy's tvg-id, moves the row out of public (NSFW out of private too); a row
+        channel, named by the key, by any copy's tvg-id or as the one iptv-org channel on the row's host+path (keying or
+        not: by_path), moves the row out of public (NSFW out of private too); a row
         whose key names no channels.json channel moves to nsfw when its name or any copy's name (names) is an NSFW
         channel's name or alt name; empty country and category cells are filled from channels.json."""
         row["channel"] = self.key(row, next((t for t in tvg_ids if self.info.get(t.split("@")[0].lower())), ""))
         named = [self.info.get(k.split("@")[0].lower()) for k in [row["channel"], *tvg_ids]]
-        for info in filter(None, named):
+        neighbour = self.path_neighbour.get(_host_path(row["url"]), "")
+        for info in filter(None, named + [self.info.get(neighbour.split("@")[0].lower())]):
             self._flag(row, info)
         # The owner's rulings follow the channel's own URLs, never a host+path neighbour (by_path is a guess: a shared
         # endpoint names the channel elsewhere).
