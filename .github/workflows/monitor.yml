@@ -3,6 +3,12 @@
 name: Monitor
 
 on:
+  # D5: twice a day 12 h apart, the pair 3 h later each day over a 4-day cycle (every 3-hour UTC slot every 4 days)
+  schedule:
+    - cron: '17 0,12 1,5,9,13,17,21,25,29 * *'
+    - cron: '17 3,15 2,6,10,14,18,22,26,30 * *'
+    - cron: '17 6,18 3,7,11,15,19,23,27,31 * *'
+    - cron: '17 9,21 4,8,12,16,20,24,28 * *'
   workflow_dispatch:
     inputs:
       budget:
@@ -25,7 +31,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 45  # just above the budget; a killed run commits nothing
+    timeout-minutes: 20  # just above the budget; a killed run commits nothing
     permissions:
       contents: write
     steps:
@@ -36,7 +42,7 @@ jobs:
           persist-credentials: false
       - name: Probe
         env:
-          BUDGET: ${{ inputs.budget || 2400 }}
+          BUDGET: ${{ inputs.budget || 900 }}  # a whole lap took 324 s (Spec 71 M1.3); FAST samples can hang ~500 s
           LOOKUPS: ${{ inputs.lookups || 8 }}
         run: python3 harvest/monitor.py . --budget="$BUDGET" --lookups="$LOOKUPS"
       - name: Commit

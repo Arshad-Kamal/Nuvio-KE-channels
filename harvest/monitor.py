@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Probes a channel repo's pool and keeps per-URL state (Nuvio-Project Spec 71 M1.2).
 
-Usage: monitor.py <repo> --budget SECONDS [--workers N] [--lookups N]
+Usage: monitor.py <repo> --budget SECONDS [--workers N] [--lookups N] [--runs-a-day 1|2]
 
 <repo> is the public checkout (it holds harvest/; pool: pool/streams.tsv) or the private repo (pool/private.tsv and
 pool/nsfw.tsv); the kind is read from the repo, so no argument can mix the two. The monitor never changes membership:
@@ -15,8 +15,9 @@ names one: nsfw or drm hides a listed source or a minted provenance); a fault re
 A listed host or list is rules.py's only defence against Xtream's short-form credential URLs (D17, D8); build_pool
 refuses a listed list its rows could not show (D9).
 
-FAST rows (D1): a jmp2.uk or i.mjh.nz URL naming a Pluto/Samsung/Roku/Plex channel is judged by its service's index
-(listed / unlisted), plus a sample of US rows probed each run (fast_results); it is never probed in the ring.
+FAST rows (D1, D11): a jmp2.uk or i.mjh.nz URL naming a Pluto/Samsung/Roku/Plex channel is judged by its service's
+index (listed / unlisted), plus a sample of US rows probed each run that catches an outage of the whole service
+(service_result); it is never probed in the ring.
 
 Probe (Design 2): the row's URL with its headers cell (else an honest UA), an HLS master's first variant, then a range
 of the segment three from the end; DASH and audio/video answers are judged on the first answer. Each host is looked up
@@ -73,6 +74,8 @@ PER_HOST = 4  # probes in flight per row host
 DNS_LOOKUPS = 8  # lookups at once: a loaded resolver answers slowly and falsely (Spec 71 M1.2); `--lookups` tunes it
 DNS_RETRY_PAUSE = 1.0
 SAMPLE = 20  # FAST sample probes per service per run (D1)
+SAMPLE_FLOOR = 10  # a smaller sample never judges its service: its rows go by the index alone (D11)
+OUTAGE_PERCENT = 90  # a service is out when this share of its sample fails, or is blocked (D11: 18 of 20)
 STATES = ("alive", "suspect", "down", "gone", "blocked")
 CLASSES = ("ok", "drm", "blocked", "down", "gone", "listed", "unlisted")
 SUCCESS = frozenset(("ok", "drm", "listed"))
@@ -80,7 +83,7 @@ HARD = frozenset(("gone", "unlisted"))  # D3's hard last result: 404/410/NXDOMAI
 WINDOWS = (14, 30)  # days failing before gone: with a hard last result, with any (doubled for "Not 24/7")
 STATE_COLUMNS = ["url", "state", "since", "class", "slots"]
 SLOTS = 8  # UTC 3-hour slots (D5)
-RUNS_A_WEEK = 14  # D5: two runs a day, 12 hours apart (one before 12:00 UTC, one after)
+RUNS_A_DAY = (1, 2)  # D10: the private repo once a day; D5: the public repo twice, 12 hours apart
 STATE_FILE = Path("monitor") / "state.tsv"
 CURSOR_FILE = Path("monitor") / "cursor"
 KEY_LENGTH = 16
@@ -524,18 +527,19 @@ class Prober:
 
 # --- one run: what to probe, the sweep, the FAST indexes ------------------------------------------------------------
 
-def run_slot(moment: datetime) -> int:
-    """This run's place in the week (0-13): the UTC day and whether it is before or after 12:00 (D5)."""
+def run_slot(moment: datetime, runs_a_day: int = 2) -> int:
+    """This run's place in the week (0 to 7 x runs_a_day - 1): the UTC day, and with two runs a day whether it is
+    before or after 12:00 (D5, D10)."""
     utc = moment.astimezone(timezone.utc)
-    return utc.date().toordinal() % 7 * 2 + utc.hour // 12
+    return utc.date().toordinal() % 7 * runs_a_day + utc.hour * runs_a_day // 24
 
 
-def gone_due(rows: Iterable[Row], state: dict[str, Record], now: datetime) -> list[Row]:
+def gone_due(rows: Iterable[Row], state: dict[str, Record], now: datetime, runs_a_day: int = 2) -> list[Row]:
     """The gone rows this run re-probes (D3: weekly): those whose key falls in this run's slot of the week, so each is
     probed once a week whatever the ring's lap length (a missed run leaves its rows to the next week)."""
-    slot = run_slot(now)
+    slot = run_slot(now, runs_a_day)
     return sorted((r for r in rows if r.url in state and state[r.url].state == "gone"
-                   and int(r.key, 16) % RUNS_A_WEEK == slot), key=lambda r: r.key)
+                   and int(r.key, 16) % (7 * runs_a_day) == slot), key=lambda r: r.key)
 
 
 def ring(rows: Iterable[Row], cursor: str | None, state: dict[str, Record]) -> list[Row]:
@@ -694,12 +698,16 @@ def pick_samples(rows: Iterable[Row], indexes: dict[str, set[str]], rng: random.
 
 
 def service_result(classes: list[str]) -> str:
-    """A service's whole sample: the commonest failing class when most probes fail, blocked when most are blocked,
-    else listed (no sample: listed)."""
+    """A service's whole sample (D11): the commonest failing class when OUTAGE_PERCENT of the probes fail, blocked when
+    that share is blocked, else listed; a sample under SAMPLE_FLOOR is listed. Only an outage of the whole service
+    (jmp2.uk gone, say) speaks for every row: Plex fails channel by channel (about half its listed ids answer 404),
+    and a majority rule flipped thousands of rows between runs minutes apart (Spec 71 M1.3)."""
+    if len(classes) < SAMPLE_FLOOR:
+        return "listed"
     failing = [cls for cls in classes if cls in ("down", "gone")]
-    if 2 * len(failing) > len(classes):
+    if 100 * len(failing) >= OUTAGE_PERCENT * len(classes):
         return Counter(failing).most_common(1)[0][0]
-    if 2 * classes.count("blocked") > len(classes):
+    if 100 * classes.count("blocked") >= OUTAGE_PERCENT * len(classes):
         return "blocked"
     return "listed"
 
@@ -715,6 +723,15 @@ def fast_results(rows: Iterable[Row], indexes: dict[str, set[str]], samples: lis
                 if all(r.url in probed for r in planned[service])}
     return {row.url: verdicts[row.service] if row.pid in indexes[row.service] else "unlisted"
             for row in rows if row.service in verdicts}
+
+
+def sample_counts(samples: list[Row], probed: dict[str, str]) -> dict[str, dict[str, int]]:
+    """service -> its sample's classes by count (the evidence for tuning D11's rule; no URL)."""
+    counts: dict[str, Counter] = defaultdict(Counter)
+    for row in samples:
+        if row.url in probed:
+            counts[row.service][probed[row.url]] += 1
+    return {service: dict(sorted(found.items())) for service, found in sorted(counts.items())}
 
 
 # --- states ------------------------------------------------------------------------------------------------------
@@ -844,6 +861,7 @@ class Report:
     due: int
     taken: int
     sampled: int
+    samples: dict[str, dict[str, int]]  # service -> sample classes by count
     indexes: dict[str, str]
     results: Counter
     states: Counter
@@ -854,7 +872,7 @@ class Report:
 
 
 def run(repo: Path, now: datetime, stop_at: float, prober: Prober, workers: int = WORKERS,
-        lookups: int = DNS_LOOKUPS, fetch: Callable[[str], lists.Fetched] = lists.fetch) -> Report:
+        lookups: int = DNS_LOOKUPS, fetch: Callable[[str], lists.Fetched] = lists.fetch, runs_a_day: int = 2) -> Report:
     """One monitor run over the repo (module docstring); raises MonitorError before writing anything it refuses."""
     started = time.monotonic()
     rows = load_rows(pool_paths(repo))
@@ -863,7 +881,7 @@ def run(repo: Path, now: datetime, stop_at: float, prober: Prober, workers: int 
     others = [row for row in rows.values() if not row.service]
     indexes = usable_indexes(fetch_indexes(fetch), fast_rows)
     samples = pick_samples(fast_rows, indexes, random.Random(now.isoformat()))
-    gone = gone_due(others, state, now)
+    gone = gone_due(others, state, now, runs_a_day)
     head = samples + gone  # probed first, outside the ring and its cursor
     due = ring(others, cursor, state)
     done = sweep(head + due, prober, stop_at, workers, deadline=prober.deadline, resolve=prober.resolver.warm,
@@ -874,7 +892,7 @@ def run(repo: Path, now: datetime, stop_at: float, prober: Prober, workers: int 
     new_state = advance(state, results, rows, now)
     write_state(repo, new_state, due[taken - 1].key if taken else cursor, rows, now.astimezone(timezone.utc).date())
     return Report(rows=len(rows), fast=len(fast_rows), gone_due=len(gone), due=len(due), taken=taken,
-                  sampled=len(samples), indexes={s: ("used" if s in indexes else "not used") for s in FAST_SERVICES},
+                  sampled=len(samples), samples=sample_counts(samples, done.results), indexes={s: ("used" if s in indexes else "not used") for s in FAST_SERVICES},
                   results=Counter(results.values()), states=Counter(r.state for r in new_state.values()),
                   changed=sum(1 for url, r in new_state.items() if state.get(url) != r), errors=done.errors,
                   lookups=Counter(prober.resolver.outcomes), seconds=round(time.monotonic() - started, 1))
@@ -887,15 +905,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--budget", type=float, required=True, help="seconds from start after which no probe starts")
     parser.add_argument("--workers", type=int, default=WORKERS)
     parser.add_argument("--lookups", type=int, default=DNS_LOOKUPS, help="DNS lookups at once")
+    parser.add_argument("--runs-a-day", type=int, choices=RUNS_A_DAY, default=2,
+                        help="scheduled runs a day (gone rows are re-probed weekly by run slot)")
     args = parser.parse_args(argv)
     try:
         report = run(args.repo, datetime.now(timezone.utc), started + args.budget,
-                     Prober(Resolver(lookups=args.lookups)), args.workers, args.lookups)
+                     Prober(Resolver(lookups=args.lookups)), args.workers, args.lookups, runs_a_day=args.runs_a_day)
     except MonitorError as error:
         print(f"monitor: {error}; nothing written", file=sys.stderr)
         return 1
     print(f"in scope {report.rows} (FAST {report.fast}); gone due {report.gone_due}; ring due {report.due}, taken "
           f"{report.taken}; FAST sample {report.sampled}; indexes {report.indexes}; {report.seconds} s")
+    print(f"FAST samples {report.samples}")
     print(f"results {dict(report.results)}; states {dict(report.states)}; rows changed {report.changed}"
           + (f"; probe errors {dict(report.errors)}" if report.errors else ""))
     usage = resource.getrusage(resource.RUSAGE_SELF)  # the runner's fit (Spec 71 D6): CPU against wall time
