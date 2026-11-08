@@ -12,6 +12,9 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.request
+from contextlib import redirect_stderr
+from io import StringIO
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -81,6 +84,15 @@ ROUTES = {
     "/decoy": (302, "text/plain", b"", {"Location": "/video_no_available.mp4"}),
     "/video_no_available.mp4": (200, "video/mp4", b"\x00\x00\x00\x18ftypmp42", {}),
     "/gz.m3u8": (200, HLS, gzip.compress(MEDIA.replace(b"seg", b"/seg")), {}),
+    "/badgz.m3u8": (200, HLS, b"\x1f\x8bnot gzip", {}),
+    "/htmlvariant.m3u8": (200, HLS, master("page"), {}),
+    "/blockvariant.m3u8": (200, HLS, master("akamai"), {}),
+    "/textseg.m3u8": (200, HLS, media("textts"), {}),
+    "/textts": (200, "text/vnd.trolltech.linguist", TS, {}),
+    # Cut at the cap inside its last line: dropping that line makes seg2.ts (ok) the segment three from the end; keeping
+    # it would pick "missing" (down).
+    "/cut.m3u8": (200, HLS, media("seg2.ts") + b"#EXTINF:6,\nmissing\n#EXTINF:6,\nseg2.ts\n#EXTINF:6,\n"
+                  + b"x" * monitor.PLAYLIST_CAP, {}),
 }
 
 
@@ -94,9 +106,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/referer":
             ok = self.headers.get("Referer") == "https://site.example/"
             status, kind, body, extra = (200, "video/mp2t", TS, {}) if ok else (403, "text/plain", b"", {})
-        elif self.path.startswith("/redirect-nx"):
-            target = f"http://nx.test:{self.server.server_port}/"
+        elif self.path in ("/redirect-nx", "/redirect-lan"):
+            target = f"http://{self.path[10:]}.test:{self.server.server_port}/video"
             status, kind, body, extra = 302, "text/plain", b"", {"Location": target}
+        elif self.path == "/nxvariant.m3u8":
+            status, kind, body, extra = 200, HLS, master(f"http://nx.test:{self.server.server_port}/media.m3u8"), {}
         else:
             status, kind, body, extra = ROUTES.get(self.path, (404, "text/plain", b"", {}))
         self.send_response(status)
@@ -191,8 +205,16 @@ class ProbeClassTest(ServerTest):
         self.assertEqual(self.probe("/empty.m3u8"), "down")
         self.assertEqual(self.probe("/rtmp.m3u8"), "down")
 
-    def test_a_text_segment_is_blocked(self):
+    def test_a_text_segment_is_blocked_but_media_bytes_win_over_a_text_type(self):
         self.assertEqual(self.probe("/htmlseg.m3u8"), "blocked")
+        self.assertEqual(self.probe("/textseg.m3u8"), "ok")
+
+    def test_an_html_variant_is_down_unless_it_names_a_block(self):
+        self.assertEqual(self.probe("/htmlvariant.m3u8"), "down")
+        self.assertEqual(self.probe("/blockvariant.m3u8"), "blocked")
+
+    def test_a_cut_playlist_drops_its_partial_last_line(self):
+        self.assertEqual(self.probe("/cut.m3u8"), "ok")
 
     def test_dash_and_av_answers_are_judged_on_the_first_answer(self):
         self.assertEqual(self.probe("/dash.mpd"), "drm")
@@ -220,21 +242,44 @@ class ProbeClassTest(ServerTest):
         self.assertEqual(Handler.seen[-1][2], monitor.USER_AGENT)
         self.assertEqual(self.probe("/referer", headers=(("Referer", "https://site.example/"),)), "ok")
 
-    def test_a_gzip_playlist_is_read(self):
+    def test_a_gzip_playlist_is_read_and_a_broken_one_is_down(self):
         self.assertEqual(self.probe("/gz.m3u8"), "ok")
+        self.assertEqual(self.probe("/badgz.m3u8"), "down")
 
     def test_a_probe_past_its_deadline_is_down(self):
         prober = monitor.Prober(monitor.Resolver(self.lookup, public=lambda a: True), deadline=0.5)
         started = time.monotonic()
         result = monitor.sweep([row(self.url("/slow"))], prober, time.monotonic() + 10, deadline=0.5)
         self.assertEqual(result.results, {self.url("/slow"): "down"})
-        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertLess(time.monotonic() - started, 1.8)
 
 
 class ResolverTest(ServerTest):
     def test_no_such_name_is_gone_for_the_row_and_its_redirects_only(self):
         self.assertEqual(self.probe("/media.m3u8", host="nx.test"), "gone")
         self.assertEqual(self.probe("/redirect-nx"), "gone")
+        self.assertEqual(self.probe("/nxvariant.m3u8"), "down")
+
+    def test_a_redirect_to_a_non_public_address_is_refused_before_connecting(self):
+        self.prober = monitor.Prober(monitor.Resolver(self.lookup, public=lambda address: address != "10.0.0.1"))
+        self.assertEqual(self.probe("/redirect-lan"), "down")
+        self.assertEqual([path for path, _, _ in Handler.seen], ["/redirect-lan"])
+
+    def test_https_connections_go_through_the_resolver(self):
+        resolver = monitor.Resolver(FakeLookup())
+        handler = next(h for h in monitor.opener(resolver).handlers if isinstance(h, urllib.request.HTTPSHandler))
+        connection = handler._connection("good.test", timeout=1, context=handler._context)
+        self.assertEqual(connection._create_connection, resolver.connect)
+
+    def test_concurrent_askers_share_one_lookup(self):
+        lookup = FakeLookup()
+        resolver = monitor.Resolver(lambda host: time.sleep(0.3) or lookup(host), public=lambda address: True)
+        threads = [threading.Thread(target=resolver.addresses, args=("good.test",)) for _ in range(5)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(lookup.calls["good.test"], 1)
 
     def test_no_data_is_down_it_rose_with_resolver_load(self):
         self.assertEqual(self.probe("/media.m3u8", host="nodata.test"), "down")
@@ -273,23 +318,26 @@ class SweepTest(unittest.TestCase):
 
         def probe(r):
             with lock:
-                active[r.host] += 1
-                peak[r.host] = max(peak[r.host], active[r.host])
+                for key in (r.host, "all"):
+                    active[key] += 1
+                    peak[key] = max(peak[key], active[key])
             time.sleep(0.03)
             with lock:
-                active[r.host] -= 1
+                for key in (r.host, "all"):
+                    active[key] -= 1
             return "ok"
 
-        rows = [row(f"http://a.test/{i}") for i in range(12)] + [row(f"http://b.test/{i}") for i in range(4)]
-        done = monitor.sweep(rows, probe, time.monotonic() + 10, workers=8, per_host=4)
-        self.assertEqual(len(done.results), 16)
-        self.assertLessEqual(peak["a.test"], 4)
-        self.assertEqual(done.taken, 16)
+        rows = [row(f"http://{h}.test/{i}") for h in "abc" for i in range(8)]
+        done = monitor.sweep(rows, probe, time.monotonic() + 10, workers=6, per_host=4)
+        self.assertEqual(len(done.results), 24)
+        self.assertLessEqual(max(peak[f"{h}.test"] for h in "abc"), 4)
+        self.assertLessEqual(peak["all"], 6)
+        self.assertEqual(done.taken, 24)
 
     def test_nothing_starts_after_the_budget_and_queued_rows_are_missed(self):
         self.assertEqual(monitor.sweep([row("http://a.test/1")], lambda r: "ok", time.monotonic() - 1).taken, 0)
         rows = [row(f"http://a.test/{i}") for i in range(3)] + [row("http://b.test/1")]
-        done = monitor.sweep(rows, lambda r: time.sleep(0.3) or "ok", time.monotonic() + 0.1, per_host=1)
+        done = monitor.sweep(rows, lambda r: time.sleep(1.5) or "ok", time.monotonic() + 0.5, per_host=1)
         self.assertEqual(set(done.results), {"http://a.test/0", "http://b.test/1"})
         self.assertEqual(done.taken, 4)
 
@@ -307,33 +355,34 @@ class SweepTest(unittest.TestCase):
 
     def test_rows_still_waiting_for_a_lookup_at_the_budget_are_not_probed(self):
         rows = [row("http://slow.test/1"), row("http://fast.test/1")]
-        done = monitor.sweep(rows, lambda r: "ok", time.monotonic() + 0.3, lookups=2,
-                             resolve=lambda host: time.sleep(1 if host == "slow.test" else 0))
+        done = monitor.sweep(rows, lambda r: "ok", time.monotonic() + 0.5, lookups=2,
+                             resolve=lambda host: time.sleep(2 if host == "slow.test" else 0))
         self.assertEqual(done.results, {"http://fast.test/1": "ok"})
         self.assertEqual(done.taken, 2)
 
-    def test_an_unexpected_probe_error_counts_as_down(self):
+    def test_an_unexpected_probe_error_is_counted_and_gives_no_result(self):
         def probe(r):
             raise RuntimeError("bug")
 
         done = monitor.sweep([row("http://a.test/1")], probe, time.monotonic() + 10)
-        self.assertEqual(done.results, {"http://a.test/1": "down"})
+        self.assertEqual(done.results, {})
         self.assertEqual(done.errors, Counter({"RuntimeError": 1}))
 
 
 class RingTest(unittest.TestCase):
     def test_starts_after_the_cursor_and_wraps(self):
         rows = sorted((row(f"http://a.test/{i}") for i in range(5)), key=lambda r: r.key)
-        self.assertEqual(monitor.ring(rows, None, {}, date(2026, 11, 8)), rows)
-        self.assertEqual(monitor.ring(rows, rows[1].key, {}, date(2026, 11, 8)), rows[2:] + rows[:2])
+        self.assertEqual(monitor.ring(rows, None, {}), rows)
+        self.assertEqual(monitor.ring(rows, rows[1].key, {}), rows[2:] + rows[:2])
 
-    def test_gone_rows_only_on_their_weekday(self):
-        gone = row("http://a.test/gone")
+    def test_gone_rows_leave_the_ring_and_are_due_once_a_week_whatever_the_lap(self):
+        gone, live = row("http://a.test/gone"), row("http://a.test/live")
         state = {gone.url: Record("gone", date(2026, 1, 1), "gone", "0" * 8)}
-        days = [date(2026, 11, 1) + timedelta(days=n) for n in range(7)]
-        probed = [day for day in days if monitor.ring([gone], None, state, day)]
-        self.assertEqual(len(probed), 1)
-        self.assertEqual(int(gone.key, 16) % 7, probed[0].toordinal() % 7)
+        self.assertEqual(monitor.ring([gone, live], None, state), [live])
+        runs = [datetime(2026, 11, 1, 3, 17, tzinfo=timezone.utc) + timedelta(hours=12 * n) for n in range(28)]
+        due = [run for run in runs if monitor.gone_due([gone, live], state, run)]
+        self.assertEqual(len(due), 2)  # one run in each of the two weeks
+        self.assertEqual(due[1] - due[0], timedelta(days=7))
 
 
 class FastTest(unittest.TestCase):
@@ -364,8 +413,14 @@ class FastTest(unittest.TestCase):
 
     def test_unlisted_rows_and_the_sample_result(self):
         listed, dropped = self.fast("a" * 24), self.fast("b" * 24)
-        results = monitor.fast_results([listed, dropped], {"pluto": {listed.pid}}, {"pluto": ["down"] * 3})
+        results = monitor.fast_results([listed, dropped], {"pluto": {listed.pid}}, [listed], {listed.url: "down"})
         self.assertEqual(results, {listed.url: "down", dropped.url: "unlisted"})
+
+    def test_a_sample_cut_short_gives_its_service_no_result(self):
+        rows = [self.fast(f"{i:024x}") for i in range(3)]
+        listed = {"pluto": {r.pid for r in rows}}
+        self.assertEqual(monitor.fast_results(rows, listed, rows, {rows[0].url: "down"}), {})
+        self.assertEqual(set(monitor.fast_results(rows, listed, [], {}).values()), {"listed"})  # no US rows
 
     def test_fetch_indexes_reads_ids_and_tolerates_failures(self):
         def fetch(url):
@@ -440,6 +495,8 @@ class ScopeTest(unittest.TestCase):
 
     def test_credentials_minted_and_other_schemes_are_never_probed(self):
         for url, cells in [("http://panel.example:8080/live/u1/p1/1.ts", {}),
+                           ("http://panel.example:8080/u1/p1/1", {"reason": "listed:xtreamiptv.xyz"}),
+                           ("https://cdn.example/live.m3u8", {"headers": '{"Referer":"https://s.example/?token=a"}'}),
                            ("https://cdn.example/live.m3u8?token=abc", {}),
                            ("https://cdn.example/live.m3u8", {"reason": "minted"}),
                            ("https://cdn.example/live.m3u8", {"reason": "credential"}),
@@ -460,6 +517,9 @@ class ScopeTest(unittest.TestCase):
             headers='{"Referer":"https://site.example/","Cookie":"s=1","User-Agent":"bad\\r\\nX: y"}'))
         self.assertEqual((found.service, found.pid, found.us, found.not247), ("pluto", f"pluto:{PLUTO_ID}", True, True))
         self.assertEqual(found.headers, (("Referer", "https://site.example/"),))
+        latin = monitor.scoped(self.pool_row("https://cdn.example/a.m3u8", reason="fast-host",
+                                             headers='{"User-Agent":"Caf\u00e9/1","Origin":"https://\u4e2d.example"}'))
+        self.assertEqual(latin.headers, (("User-Agent", "Caf\u00e9/1"),))  # http.client sends Latin-1 only
         relay = monitor.scoped(self.pool_row("https://i.mjh.nz/.r/news.m3u8", reason="fast-host"))
         self.assertIsNone(relay.service)
 
@@ -472,18 +532,22 @@ class FilesTest(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def test_pool_files_by_repo_kind(self):
+    def test_pool_paths_by_repo_kind(self):
         public, private = self.root / "public", self.root / "private"
         (public / "harvest").mkdir(parents=True)
         private.mkdir()
-        self.assertEqual(monitor.pool_files(public), [public / "pool" / "streams.tsv"])
-        self.assertEqual(monitor.pool_files(private), [private / "pool" / "private.tsv", private / "pool" / "nsfw.tsv"])
+        self.assertEqual(monitor.pool_paths(public), [public / "pool" / "streams.tsv"])
+        self.assertEqual(monitor.pool_paths(private), [private / "pool" / "private.tsv", private / "pool" / "nsfw.tsv"])
         with self.assertRaises(MonitorError):
-            monitor.pool_files(public / "pool")  # inside the public checkout
+            monitor.pool_paths(public / "pool")  # inside the public checkout
         (public / "pool").mkdir()
         (public / "pool" / "nsfw.tsv").write_text("x")
         with self.assertRaises(MonitorError):
-            monitor.pool_files(public)
+            monitor.pool_paths(public)
+        with redirect_stderr(StringIO()) as err:
+            self.assertEqual(monitor.main([str(public), "--budget", "1"]), 1)
+        self.assertIn("nothing written", err.getvalue())
+        self.assertFalse((public / "monitor").exists())
 
     def test_state_round_trip_and_refusals(self):
         a = row("http://a.test/1")
@@ -523,7 +587,8 @@ class RunTest(ServerTest):
             urls = [self.url(p) for p in ("/master.m3u8", "/missing", "/forbidden")]
             fast = f"https://jmp2.uk/plu-{PLUTO_ID}.m3u8"
             rows = [{**{c: "-" for c in build_pool.POOL_COLUMNS}, "url": u, "reason": "iptv-org-url",
-                     "seen_in": "iptv-org"} for u in urls + [fast]]
+                     "seen_in": "iptv-org", "country": "US" if u == fast else "-"} for u in urls + [fast]]
+            self.lookup.table["jmp2.uk"] = socket.EAI_NONAME  # the US sample row: its service reads gone
             (repo / "pool").mkdir()
             (repo / "pool" / "streams.tsv").write_text(build_pool.tsv(rows, build_pool.POOL_COLUMNS))
             index = {"regions": {"ca": {"channels": {PLUTO_ID: {"name": "News"}}}}}
@@ -538,9 +603,9 @@ class RunTest(ServerTest):
             state = monitor.read_state(repo)
             self.assertEqual({u: (r.state, r.cls) for u, r in state.items()},
                              {urls[0]: ("alive", "ok"), urls[1]: ("suspect", "gone"), urls[2]: ("blocked", "blocked"),
-                              fast: ("alive", "listed")})
+                              fast: ("suspect", "gone")})
             self.assertEqual(state[urls[0]].slots, "01000000")
-            self.assertEqual((report.taken, report.due, report.sampled), (3, 3, 0))
+            self.assertEqual((report.taken, report.due, report.sampled), (3, 3, 1))
             self.assertEqual(monitor.read_cursor(repo), max(monitor.ring_key(u) for u in urls))
 
             report = monitor.run(repo, first + timedelta(hours=12), time.monotonic() + 10, self.prober,
@@ -548,7 +613,13 @@ class RunTest(ServerTest):
             state = monitor.read_state(repo)
             self.assertEqual(state[urls[1]].state, "down")
             # an index listing none of the pool's ids is not used: the FAST row keeps its record
-            self.assertEqual(state[fast], Record("alive", first.date(), "listed", "01000000"))
+            self.assertEqual(state[fast], Record("suspect", first.date(), "gone", "00000000"))
+            cursor = monitor.read_cursor(repo)
+
+            # the budget already spent: nothing probed, the sample cut short, nothing changes
+            monitor.run(repo, first + timedelta(hours=24), time.monotonic() - 1, self.prober, fetch=fetch)
+            self.assertEqual(monitor.read_state(repo), state)
+            self.assertEqual(monitor.read_cursor(repo), cursor)
 
 
 if __name__ == "__main__":

@@ -266,10 +266,13 @@ def _public_host(url: str) -> None:
         infos = socket.getaddrinfo(parts.hostname, port or 443, proto=socket.IPPROTO_TCP)
     except (OSError, UnicodeError) as error:
         raise FetchError(f"cannot resolve {parts.hostname}: {error}") from error
-    for info in infos:
-        address = ipaddress.ip_address(info[4][0].split("%")[0])
-        if not address.is_global:
-            raise FetchError(f"{parts.hostname} resolves to a non-public address")
+    if not all(public_address(info[4][0]) for info in infos):
+        raise FetchError(f"{parts.hostname} resolves to a non-public address")
+
+
+def public_address(address: str) -> bool:
+    """Whether a looked-up address (an IPv6 one may carry a %zone) is public: not the LAN, loopback, link-local..."""
+    return ipaddress.ip_address(address.split("%")[0]).is_global
 
 
 class _PublicRedirects(urllib.request.HTTPRedirectHandler):
@@ -281,7 +284,7 @@ class _PublicRedirects(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_PublicRedirects)
 
 
-def _encoded(url: str) -> str:
+def encoded(url: str) -> str:
     """The URL with spaces and non-ASCII in its path and query percent-encoded (research recorded some as read)."""
     parts = urlsplit(url)
     return urlunsplit(parts._replace(path=quote(parts.path, safe="/%:@!$&'()*+,;=~"),
@@ -316,7 +319,7 @@ def fetch(url: str) -> Fetched:
 def _fetch(url: str, deadline: float) -> Fetched:
     _public_host(url)
     try:
-        request = urllib.request.Request(_encoded(url),
+        request = urllib.request.Request(encoded(url),
                                          headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity"})
     except ValueError as error:
         raise FetchError(f"bad URL: {error}") from error
@@ -335,14 +338,19 @@ def _fetch(url: str, deadline: float) -> Fetched:
         raise FetchError(str(error)[:200]) from error
     body = b"".join(chunks)
     if body[:2] == b"\x1f\x8b":
-        try:
-            with gzip.GzipFile(fileobj=io.BytesIO(body)) as unzipped:
-                body = unzipped.read(MAX_GUNZIPPED + 1)
-        except (OSError, EOFError, zlib.error) as error:
-            raise FetchError(f"bad gzip: {error}") from error
+        body = gunzip(body, MAX_GUNZIPPED)
         if len(body) > MAX_GUNZIPPED:
             raise FetchError(f"over {MAX_GUNZIPPED} bytes gunzipped")
     return Fetched(url, final_url, body)
+
+
+def gunzip(body: bytes, cap: int) -> bytes:
+    """A gzip body decompressed, at most cap + 1 bytes (more than cap: over the cap); FetchError when unreadable."""
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(body)) as unzipped:
+            return unzipped.read(cap + 1)
+    except (OSError, EOFError, zlib.error) as error:
+        raise FetchError(f"bad gzip: {error}") from error
 
 
 # --- parsing ----------------------------------------------------------------------------------------------------

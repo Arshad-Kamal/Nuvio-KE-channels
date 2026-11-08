@@ -9,9 +9,10 @@ it reads the pool and writes only monitor/state.tsv (url, state, since, class, s
 server sent is written: cells are enums, dates and slot bits, every URL must be an in-scope pool URL, and a run that
 breaks any of that writes nothing (exit 1). Output is aggregate counts, never a URL.
 
-Scope (Spec 71 D2), judged by the URL, not the reason (rules.verdict stops at NSFW, so an nsfw row's reason hides a
-credential or a token): http(s) only, no credential/minted/non-http reason, no YouTube host, no credential in the URL or
-headers (D17), no minted URL (token_shaped or minted notes) unless iptv-org lists it.
+Scope (Spec 71 D2), judged by the URL, not only the reason (rules.verdict stops at NSFW, so an nsfw row's reason hides a
+credential or a token): http(s) only; no credential, minted, non-http or listed reason (a listed host or list is
+rules.py's only defence against Xtream's short-form credential URLs: D17); no YouTube host; no credential in the URL or
+headers (D17); no minted URL, headers or notes unless iptv-org lists the URL.
 
 FAST rows (D1): a jmp2.uk or i.mjh.nz URL naming a Pluto/Samsung/Roku/Plex channel is judged by its service's index
 (listed / unlisted), plus a sample of US rows probed each run (fast_results); it is never probed in the ring.
@@ -21,15 +22,13 @@ of the segment three from the end; DASH and audio/video answers are judged on th
 once per run, before its rows' probes start, and connections go to the looked-up public address (Resolver). One
 attempt per run.
 
-States (D3): see step(). Ring (D6): rows in URL-hash order from the cursor, within a time budget: ring(), sweep().
+States (D3): step(). Order of a run (D6): the FAST sample, the gone rows due this run (gone_due: weekly), then the ring
+in URL-hash order from the cursor (ring), within a time budget (sweep).
 """
 import argparse
 import contextlib
-import gzip
 import hashlib
 import http.client
-import io
-import ipaddress
 import json
 import os
 import queue
@@ -42,7 +41,6 @@ import threading
 import time
 import urllib.error
 import urllib.request
-import zlib
 from bisect import bisect_right
 from collections import Counter, defaultdict, deque
 from collections.abc import Callable, Iterable
@@ -51,11 +49,12 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from itertools import count
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import urljoin, urlsplit
 
+import build_pool
 import lists
 from allowlist import has_suffix
-from build_pool import read_tsv
 from channels import provider_id
 from extract_research import private_repo
 from rules import MINTED_NOTES, hidden_credential, token_shaped
@@ -65,12 +64,11 @@ SOCKET_TIMEOUT = 10  # per socket operation
 PROBE_DEADLINE = 25  # whole probe once its host is looked up: connects, TLS, redirects, every step (Spec 71 M1.0)
 PLAYLIST_CAP = 256 << 10  # a playlist cut here loses its partial last line
 SEGMENT_BYTES = 1 << 16
+BLOCK_PAGE_BYTES = 16 << 10  # block pages are small; the regex never scans a whole untrusted playlist-sized body
 MASTER_HOPS = 2  # a master playlist may point at another master once
 WORKERS = 128
 PER_HOST = 4  # probes in flight per row host
-# Lookups at once. M1.2, this desktop's resolver: 240 fresh hosts took 38 s at 8, 41 s at 32, 73 s at 128 at once, and
-# load turned answers into false EAI_NODATA (5, 12, 38); M1.3 measures the runner's.
-DNS_LOOKUPS = 8
+DNS_LOOKUPS = 8  # lookups at once: a loaded resolver answers slowly and falsely (Spec 71 M1.2); `--lookups` tunes it
 DNS_RETRY_PAUSE = 1.0
 SAMPLE = 20  # FAST sample probes per service per run (D1)
 STATES = ("alive", "suspect", "down", "gone", "blocked")
@@ -80,16 +78,18 @@ HARD = frozenset(("gone", "unlisted"))  # D3's hard last result: 404/410/NXDOMAI
 WINDOWS = (14, 30)  # days failing before gone: with a hard last result, with any (doubled for "Not 24/7")
 STATE_COLUMNS = ["url", "state", "since", "class", "slots"]
 SLOTS = 8  # UTC 3-hour slots (D5)
+RUNS_A_WEEK = 14  # D5: two runs a day, 12 hours apart (one before 12:00 UTC, one after)
 STATE_FILE = Path("monitor") / "state.tsv"
 CURSOR_FILE = Path("monitor") / "cursor"
 KEY_LENGTH = 16
 
-SKIP_REASONS = ("credential", "minted", "non-http")
+SKIP_REASONS = ("credential", "minted", "non-http", "listed")
 YOUTUBE_HOSTS = ("youtube.com", "youtu.be")
 FAST_HOSTS = ("jmp2.uk", "i.mjh.nz")
 FAST_SERVICES = tuple(lists.FAST_INDEXES)
 SEND_HEADERS = ("Referer", "User-Agent", "Origin")
-HEADER_VALUE = re.compile(r"[\x20-\x7e\x80-\uffff]{1,1000}")  # no control characters (no header splitting)
+# Printable Latin-1 only: no control characters (no header splitting), nothing http.client cannot encode.
+HEADER_VALUE = re.compile(r"[\x20-\x7e\xa0-\xff]{1,1000}")
 BLOCKED_CODES = frozenset((401, 402, 403, 451))
 GONE_CODES = frozenset((404, 410))
 # SAMPLE-AES (any), or a Widevine / PlayReady / FairPlay key format; AES-128 with a key URI plays and is not DRM.
@@ -100,6 +100,7 @@ DECOY_URL = re.compile(r"video_no_available", re.IGNORECASE)  # RAI's geo slate 
 # country block, Cloudflare's error 1009.
 BLOCK_PAGE = re.compile(rb"access denied.{0,4000}?reference(?:\s|&#32;)*(?:#|&#35;)|block access from your country|"
                         rb"error\s*(?:code:?\s*)?1009", re.IGNORECASE | re.DOTALL)
+FMP4_BOXES = (b"ftyp", b"styp", b"moof", b"sidx")
 
 
 class MonitorError(Exception):
@@ -128,18 +129,19 @@ class Record:
 
 # --- pool and scope ----------------------------------------------------------------------------------------------
 
-def pool_files(repo: Path) -> list[Path]:
-    """The pool files of a repo, by its kind; a public checkout holding private files, or a private repo inside a
-    public checkout, is refused (its state would be one commit from publication)."""
+def pool_paths(repo: Path) -> list[Path]:
+    """The pool files of a repo, by its kind (build_pool.pool_files names them); a public checkout holding private
+    files, or a private repo inside a public checkout, is refused (its state would be one commit from publication)."""
+    files = build_pool.pool_files(repo, repo)
     if (repo / "harvest").is_dir():
-        if any((repo / "pool" / name).exists() for name in ("private.tsv", "nsfw.tsv")):
+        if files["private"].exists() or files["nsfw"].exists():
             raise MonitorError("the public checkout holds private pool files")
-        return [repo / "pool" / "streams.tsv"]
+        return [files["public"]]
     try:
         private_repo(str(repo))
     except argparse.ArgumentTypeError as error:
         raise MonitorError(str(error)) from error
-    return [repo / "pool" / "private.tsv", repo / "pool" / "nsfw.tsv"]
+    return [files["private"], files["nsfw"]]
 
 
 def ring_key(url: str) -> str:
@@ -161,9 +163,11 @@ def _headers(cell: str) -> tuple[tuple[str, str], ...]:
 
 
 def _minted(row: dict[str, str]) -> bool:
-    """rules.verdict's minted rule on the URL and notes, which it never reaches for nsfw, listed-host or drm rows."""
+    """rules.verdict's minted rules for what a probe sends (URL, headers) and the notes; verdict never reaches them for
+    nsfw or drm rows. Token-shaped headers are minted even beside an iptv-org URL, as in verdict's cell checks."""
     listed_by_iptv_org = "iptv-org" in row["seen_in"].split(",")
-    return not listed_by_iptv_org and (token_shaped(row["url"]) or bool(MINTED_NOTES.search(row["notes"])))
+    return token_shaped(row["headers"]) or (
+        not listed_by_iptv_org and (token_shaped(row["url"]) or bool(MINTED_NOTES.search(row["notes"]))))
 
 
 def scoped(row: dict[str, str]) -> Row | None:
@@ -195,7 +199,7 @@ def load_rows(paths: Iterable[Path]) -> dict[str, Row]:
         if not path.exists():
             raise MonitorError(f"missing pool file {path.name}")
         try:
-            for found in read_tsv(path):
+            for found in build_pool.read_tsv(path):
                 row = scoped(found)
                 if row is not None:
                     rows.setdefault(row.url, row)
@@ -215,24 +219,29 @@ class ResolveError(Exception):
         self.cls = cls
 
 
+class _Outcome(Exception):
+    """A probe's class, decided before its last step (not an OSError: urllib relays it unwrapped)."""
+
+    def __init__(self, cls: str):
+        super().__init__(cls)
+        self.cls = cls
+
+
 def _lookup(host: str) -> list[str]:
     return [info[4][0] for info in socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)]
 
 
-def _public(address: str) -> bool:
-    return ipaddress.ip_address(address.split("%")[0]).is_global
-
-
 class Resolver:
     """Each host is looked up once per run (concurrent askers wait for the first); a temporary failure (EAI_AGAIN) is
-    retried once. Only EAI_NONAME (no such name) reads gone: EAI_NODATA rose with resolver load (DNS_LOOKUPS). A host
-    with any non-public address is refused, as lists does, and connections go to the addresses looked up here, so a
+    retried once. Only EAI_NONAME (no such name) reads gone: EAI_NODATA rose with resolver load. A host with any
+    non-public address is refused (lists.public_address) and connections go to the addresses looked up here, so a
     second lookup cannot answer differently. Lookups from probes (a redirect's new host) run at most `lookups` at once,
     apart from sweep's lookup stage (warm), which its own threads bound: queued behind the stage, a probe's redirect
-    lookup ran out its deadline (M1.2: a Pluto/Plex sample read 28 of 40 ok alone, 0 of 12 behind a backlog)."""
+    lookup ran out its deadline."""
 
-    def __init__(self, lookup: Callable[[str], list[str]] = _lookup, public: Callable[[str], bool] = _public,
-                 retry_pause: float = DNS_RETRY_PAUSE, lookups: int = DNS_LOOKUPS):
+    def __init__(self, lookup: Callable[[str], list[str]] = _lookup,
+                 public: Callable[[str], bool] = lists.public_address, retry_pause: float = DNS_RETRY_PAUSE,
+                 lookups: int = DNS_LOOKUPS):
         self._lookup, self._public, self._pause = lookup, public, retry_pause
         self._lock = threading.Lock()
         self._lookups = threading.BoundedSemaphore(lookups)
@@ -247,11 +256,16 @@ class Resolver:
                 entry = self._answers[host] = (threading.Event(), [])
         done, answer = entry
         if first:
-            answer.append(self._resolve(host, gated))
-            done.set()
+            try:
+                answer.append(self._resolve(host, gated))
+            except Exception as error:  # a bug: every asker gets it, so sweep counts it and records no result
+                answer.append(error)
+                raise
+            finally:
+                done.set()
         else:
             done.wait()
-        if isinstance(answer[0], ResolveError):
+        if isinstance(answer[0], Exception):
             raise answer[0]
         return answer[0]
 
@@ -327,7 +341,7 @@ class _HTTPS(urllib.request.HTTPSHandler):
 class _Redirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         if urlsplit(newurl).scheme.lower() not in ("http", "https"):  # urllib would follow ftp://
-            raise ResolveError("down", "redirect to a non-http(s) URL")
+            raise _Outcome("down")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -348,12 +362,6 @@ class Answer:
     cut: bool  # the body reached its cap
 
 
-class _Outcome(Exception):
-    def __init__(self, cls: str):
-        super().__init__(cls)
-        self.cls = cls
-
-
 def _lines(body: bytes, cut: bool) -> list[str]:
     """The URI lines of a playlist (a cut body's partial last line dropped)."""
     lines = body.decode("utf-8", "replace").splitlines()
@@ -362,27 +370,43 @@ def _lines(body: bytes, cut: bool) -> list[str]:
     return [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
 
 
-def _hls(body: bytes) -> bool:
+def _join(base: str, uri: str) -> str:
+    try:
+        return urljoin(base, uri)
+    except ValueError:  # an unbalanced "[" in a playlist line
+        raise _Outcome("down") from None
+
+
+def _is_hls(body: bytes) -> bool:
     return body.lstrip(b"\xef\xbb\xbf \t\r\n").startswith(b"#EXTM3U")
 
 
-def _html(answer: Answer) -> bool:
+def _is_html(answer: Answer) -> bool:
     return answer.content_type.startswith("text/html") or answer.body.lstrip()[:1] == b"<"
 
 
-def _media(answer: Answer) -> bool:
-    """An audio/video answer: a non-text body under an AV content type (not a playlist's audio/x-mpegurl), or two
-    MPEG-TS packets."""
-    body, kind = answer.body, answer.content_type
-    if kind.startswith(("video/", "audio/")) and "mpegurl" not in kind:
-        return bool(body) and not _text_segment(answer)
-    return len(body) > 188 and body[0] == 0x47 and body[188] == 0x47
+def _is_block_page(answer: Answer) -> bool:
+    return _is_html(answer) and bool(BLOCK_PAGE.search(answer.body[:BLOCK_PAGE_BYTES]))
 
 
-def _text_segment(answer: Answer) -> bool:
-    """A segment answered with text (a page, JSON, a playlist): a slate or an error, never media."""
-    return (answer.content_type.startswith(("text/", "application/json"))
-            or answer.body.lstrip()[:1] in (b"<", b"{", b"#"))
+def _media_bytes(body: bytes) -> bool:
+    """Two MPEG-TS packets, an fMP4 box, ID3-tagged or ADTS/MPEG audio."""
+    return ((len(body) > 188 and body[0] == 0x47 and body[188] == 0x47) or body[4:8] in FMP4_BOXES
+            or body[:3] == b"ID3" or (len(body) > 1 and body[0] == 0xFF and body[1] & 0xF0 == 0xF0))
+
+
+def _is_text(answer: Answer) -> bool:
+    """A page, JSON or playlist rather than media. Media bytes win over the content type: servers label .ts files
+    text/vnd.trolltech.linguist."""
+    return not _media_bytes(answer.body) and (answer.content_type.startswith(("text/", "application/json"))
+                                              or answer.body.lstrip()[:1] in (b"<", b"{", b"#"))
+
+
+def _is_media(answer: Answer) -> bool:
+    """An audio/video answer: media bytes, or a non-text body under an AV content type (not audio/x-mpegurl)."""
+    kind = answer.content_type
+    return _media_bytes(answer.body) or (kind.startswith(("video/", "audio/")) and "mpegurl" not in kind
+                                         and bool(answer.body) and not _is_text(answer))
 
 
 class Prober:
@@ -398,7 +422,7 @@ class Prober:
         deadline = time.monotonic() + self.deadline
         headers = {"User-Agent": USER_AGENT, "Accept-Encoding": "identity", **dict(row.headers)}
         try:
-            return self._chain(row.url, headers, deadline)
+            return self._judge(row.url, headers, deadline)
         except _Outcome as outcome:
             return outcome.cls
 
@@ -407,7 +431,7 @@ class Prober:
         cap = SEGMENT_BYTES if segment else PLAYLIST_CAP
         try:
             byte_range = {"Range": f"bytes=0-{cap - 1}"} if segment else {}
-            request = urllib.request.Request(lists._encoded(url), headers={**headers, **byte_range})
+            request = urllib.request.Request(lists.encoded(url), headers={**headers, **byte_range})
             with self._opener.open(request, timeout=self._timeout) as response:
                 chunks, size = [], 0
                 while size < cap and (chunk := response.read1(min(1 << 16, cap - size))):
@@ -427,22 +451,26 @@ class Prober:
         except (OSError, http.client.HTTPException, ValueError):  # URLError, timeouts, TLS, resets; bad URLs/headers
             raise _Outcome("down") from None
         if not segment and answer.body[:2] == b"\x1f\x8b":
-            answer.body, answer.cut = _gunzip(answer.body)
+            try:
+                body = lists.gunzip(answer.body, PLAYLIST_CAP)
+            except lists.FetchError:
+                raise _Outcome("down") from None
+            answer.body, answer.cut = body[:PLAYLIST_CAP], answer.cut or len(body) > PLAYLIST_CAP
         return answer
 
-    def _chain(self, url: str, headers: dict[str, str], deadline: float) -> str:
+    def _judge(self, url: str, headers: dict[str, str], deadline: float) -> str:
         answer = self._get(url, headers, deadline, first=True)
         if DECOY_URL.search(answer.final_url):
             return "blocked"
-        if _hls(answer.body):
-            return self._hls(answer, headers, deadline)
+        if _is_hls(answer.body):
+            return self._judge_hls(answer, headers, deadline)
         if b"<MPD" in answer.body[:4096]:
             return "drm" if b"ContentProtection" in answer.body else "ok"
-        if _media(answer):
+        if _is_media(answer):
             return "ok"
-        return "blocked" if _html(answer) and BLOCK_PAGE.search(answer.body) else "down"
+        return "blocked" if _is_block_page(answer) else "down"
 
-    def _hls(self, answer: Answer, headers: dict[str, str], deadline: float) -> str:
+    def _judge_hls(self, answer: Answer, headers: dict[str, str], deadline: float) -> str:
         for hop in range(MASTER_HOPS + 1):
             if HLS_DRM.search(answer.body):
                 return "drm"
@@ -451,57 +479,71 @@ class Prober:
             variants = _lines(answer.body, answer.cut)
             if not variants or hop == MASTER_HOPS:
                 return "down"
-            answer = self._get(urljoin(answer.final_url, variants[0]), headers, deadline, first=False)
-            if not _hls(answer.body):
-                return "blocked" if _html(answer) else "down"
+            answer = self._get(_join(answer.final_url, variants[0]), headers, deadline, first=False)
+            if not _is_hls(answer.body):
+                return "blocked" if _is_block_page(answer) else "down"
         segments = _lines(answer.body, answer.cut)
         if not segments:
             return "down"
-        segment = self._get(urljoin(answer.final_url, segments[max(0, len(segments) - 3)]), headers, deadline,
+        segment = self._get(_join(answer.final_url, segments[max(0, len(segments) - 3)]), headers, deadline,
                             first=False, segment=True)
         if not segment.body:
             return "down"
-        return "blocked" if _text_segment(segment) else "ok"
+        return "blocked" if _is_text(segment) else "ok"
 
 
-def _gunzip(body: bytes) -> tuple[bytes, bool]:
-    try:
-        with gzip.GzipFile(fileobj=io.BytesIO(body)) as unzipped:
-            data = unzipped.read(PLAYLIST_CAP + 1)
-    except (OSError, EOFError, zlib.error):
-        raise _Outcome("down") from None
-    return data[:PLAYLIST_CAP], len(data) > PLAYLIST_CAP
+# --- one run: what to probe, the sweep, the FAST indexes ------------------------------------------------------------
+
+def run_slot(moment: datetime) -> int:
+    """This run's place in the week (0-13): the UTC day and whether it is before or after 12:00 (D5)."""
+    utc = moment.astimezone(timezone.utc)
+    return utc.date().toordinal() % 7 * 2 + utc.hour // 12
 
 
-# --- one run: the ring, the sweep, the FAST indexes -----------------------------------------------------------------
+def gone_due(rows: Iterable[Row], state: dict[str, Record], now: datetime) -> list[Row]:
+    """The gone rows this run re-probes (D3: weekly): those whose key falls in this run's slot of the week, so each is
+    probed once a week whatever the ring's lap length (a missed run leaves its rows to the next week)."""
+    slot = run_slot(now)
+    return sorted((r for r in rows if r.url in state and state[r.url].state == "gone"
+                   and int(r.key, 16) % RUNS_A_WEEK == slot), key=lambda r: r.key)
 
-def ring(rows: Iterable[Row], cursor: str | None, state: dict[str, Record], today: date) -> list[Row]:
-    """The ring rows in key order starting after the cursor, wrapping once; a gone row only on its weekday (D3: gone
-    rows re-probed weekly)."""
-    ordered = sorted(rows, key=lambda r: (r.key, r.url))
+
+def ring(rows: Iterable[Row], cursor: str | None, state: dict[str, Record]) -> list[Row]:
+    """The rows that are not gone, in key order starting after the cursor, wrapping once."""
+    ordered = sorted((r for r in rows if r.url not in state or state[r.url].state != "gone"),
+                     key=lambda r: (r.key, r.url))
     start = bisect_right([r.key for r in ordered], cursor) if cursor else 0
-    weekday = today.toordinal() % 7
-    return [r for r in ordered[start:] + ordered[:start]
-            if r.url not in state or state[r.url].state != "gone" or int(r.key, 16) % 7 == weekday]
+    return ordered[start:] + ordered[:start]
 
 
 @dataclass
 class Sweep:
     results: dict[str, str]  # url -> class
     taken: int  # rows taken from the input in order (probed, or still waiting at the budget)
-    errors: Counter  # unexpected exceptions by type (each counted as down)
+    errors: Counter  # unexpected exceptions by type (their rows get no result)
+
+
+class _Probed(NamedTuple):
+    token: int
+    cls: str | None  # None: the probe raised an unexpected exception
+    error: str | None
+
+
+class _Looked(NamedTuple):
+    host: str
 
 
 def sweep(rows: list[Row], probe: Callable[[Row], str], stop_at: float, workers: int = WORKERS,
           per_host: int = PER_HOST, deadline: float = PROBE_DEADLINE, resolve: Callable[[str], None] | None = None,
-          lookups: int = DNS_LOOKUPS, clock: Callable[[], float] = time.monotonic) -> Sweep:
+          lookups: int = DNS_LOOKUPS) -> Sweep:
     """Probes rows in order, starting nothing at or after stop_at. A row first waits for its host's lookup (resolve,
     `lookups` daemon threads, one lookup per host; none when resolve is None), then for a slot of its host (at most
     `per_host` in flight); at most `workers` rows are in flight or waiting for a lookup. A row still waiting at stop_at
     is not probed. Each probe runs in a daemon thread; one not done `deadline` seconds after it started counts as down
     and is no longer waited for (a server dripping its handshake or headers holds only that thread). The deadline
-    starts after the lookup, so a slow resolver's queue never reads as a dead stream."""
-    done: queue.SimpleQueue = queue.SimpleQueue()  # ("probe", token, class, error) and ("host", host)
+    starts after the lookup, so a slow resolver's queue never reads as a dead stream. A probe that raises an
+    unexpected exception (a bug) is counted and gives its row no result, so a regression never retires rows."""
+    done: queue.SimpleQueue = queue.SimpleQueue()  # _Probed and _Looked messages
     hosts: queue.SimpleQueue = queue.SimpleQueue()
     running: dict[int, tuple[Row, float]] = {}
     looking: dict[str, list[Row]] = {}  # rows waiting for their host's lookup
@@ -515,18 +557,19 @@ def sweep(rows: list[Row], probe: Callable[[Row], str], stop_at: float, workers:
 
     def look_up() -> None:
         while (host := hosts.get()) is not None:
-            resolve(host)
-            done.put(("host", host))
+            with contextlib.suppress(Exception):  # a bug: the probe meets it again from the cache and sweep counts it
+                resolve(host)
+            done.put(_Looked(host))
 
     def attempt(token: int, row: Row) -> None:
         try:
-            done.put(("probe", token, probe(row), None))
+            done.put(_Probed(token, probe(row), None))
         except Exception as error:  # noqa: BLE001  a bug must not stop the run; counted and reported
-            done.put(("probe", token, "down", type(error).__name__))
+            done.put(_Probed(token, None, type(error).__name__))
 
     def start(row: Row) -> None:
         token = next(tokens)
-        running[token] = (row, clock() + deadline)
+        running[token] = (row, time.monotonic() + deadline)
         busy[row.host] += 1
         threading.Thread(target=attempt, args=(token, row), daemon=True).start()
 
@@ -536,18 +579,19 @@ def sweep(rows: list[Row], probe: Callable[[Row], str], stop_at: float, workers:
         else:
             waiting[row.host].append(row)
 
-    def finish(token: int, cls: str) -> None:
+    def finish(token: int, cls: str | None) -> None:
         row, _ = running.pop(token)
         busy[row.host] -= 1
-        results[row.url] = cls
-        if waiting[row.host] and clock() < stop_at:
+        if cls is not None:
+            results[row.url] = cls
+        if waiting[row.host] and time.monotonic() < stop_at:
             start(waiting[row.host].popleft())
 
     if resolve is not None:
         for _ in range(lookups):
             threading.Thread(target=look_up, daemon=True).start()
     while True:
-        while taken < len(rows) and len(running) + parked < workers and clock() < stop_at:
+        while taken < len(rows) and len(running) + parked < workers and time.monotonic() < stop_at:
             row = rows[taken]
             taken += 1
             if resolve is None or row.host in resolved:
@@ -558,28 +602,28 @@ def sweep(rows: list[Row], probe: Callable[[Row], str], stop_at: float, workers:
                 hosts.put(row.host)
             looking[row.host].append(row)
             parked += 1
-        lookups_due = parked and clock() < stop_at
+        lookups_due = parked and time.monotonic() < stop_at
         if not running and not lookups_due:
             break
-        ends = [d for _, d in running.values()] + ([stop_at] if lookups_due else [])
+        ends = [end for _, end in running.values()] + ([stop_at] if lookups_due else [])
         try:
-            message = done.get(timeout=max(0.0, min(ends) - clock()))
+            message = done.get(timeout=max(0.0, min(ends) - time.monotonic()))
         except queue.Empty:
-            now = clock()
+            now = time.monotonic()
             for token, (_, end) in list(running.items()):
                 if end <= now:
                     finish(token, "down")
             continue
-        if message[0] == "host":
-            resolved.add(message[1])
-            for row in looking.pop(message[1]):
+        if isinstance(message, _Looked):
+            resolved.add(message.host)
+            for row in looking.pop(message.host):
                 parked -= 1
-                if clock() < stop_at:
+                if time.monotonic() < stop_at:
                     place(row)
-        elif message[1] in running:  # else a probe already counted as down at its deadline
-            if message[3]:
-                errors[message[3]] += 1
-            finish(message[1], message[2])
+        elif message.token in running:  # else a probe already counted as down at its deadline
+            if message.error:
+                errors[message.error] += 1
+            finish(message.token, message.cls)
     for _ in range(lookups if resolve is not None else 0):
         hosts.put(None)
     return Sweep(results, taken, errors)
@@ -620,8 +664,8 @@ def pick_samples(rows: Iterable[Row], indexes: dict[str, set[str]], rng: random.
 
 
 def service_result(classes: list[str]) -> str:
-    """A service's sample: the commonest failing class when most probes fail, blocked when most are blocked, else
-    listed (no probes: listed)."""
+    """A service's whole sample: the commonest failing class when most probes fail, blocked when most are blocked,
+    else listed (no sample: listed)."""
     failing = [cls for cls in classes if cls in ("down", "gone")]
     if 2 * len(failing) > len(classes):
         return Counter(failing).most_common(1)[0][0]
@@ -630,11 +674,17 @@ def service_result(classes: list[str]) -> str:
     return "listed"
 
 
-def fast_results(rows: Iterable[Row], indexes: dict[str, set[str]], samples: dict[str, list[str]]) -> dict[str, str]:
-    """url -> class for FAST rows of a usable index: unlisted, else their service's sample result."""
-    verdicts = {service: service_result(samples.get(service, [])) for service in indexes}
+def fast_results(rows: Iterable[Row], indexes: dict[str, set[str]], samples: list[Row],
+                 probed: dict[str, str]) -> dict[str, str]:
+    """url -> class for FAST rows of a usable index whose sample was probed in full (a sample the budget or a bug cut
+    short says nothing: its rows keep their records): unlisted, else their service's sample result."""
+    planned: dict[str, list[Row]] = defaultdict(list)
+    for row in samples:
+        planned[row.service].append(row)
+    verdicts = {service: service_result([probed[r.url] for r in planned[service]]) for service in indexes
+                if all(r.url in probed for r in planned[service])}
     return {row.url: verdicts[row.service] if row.pid in indexes[row.service] else "unlisted"
-            for row in rows if row.service in indexes}
+            for row in rows if row.service in verdicts}
 
 
 # --- states ------------------------------------------------------------------------------------------------------
@@ -650,10 +700,10 @@ def _with_slot(slots: str, slot: int) -> str:
 def step(previous: Record | None, cls: str, today: date, slot: int, not247: bool = False) -> Record:
     """The state after one result (Spec 71 D3). since = the day the current streak (ok, failing, blocked) began.
     Success (ok, drm, listed) -> alive. Blocked is never a failure: a row turns blocked when already blocked, when
-    new, or on its second blocked result in a row; otherwise it keeps its state. A failure: alive or blocked -> suspect,
-    suspect -> down, down -> gone once it has failed for WINDOWS[0] days with a hard last result or WINDOWS[1] days
-    with any (both doubled for a "Not 24/7" row), gone stays. slots marks the UTC 3-hour slots seen working since the
-    row was last gone (D5)."""
+    new (no working run to protect), or on its second blocked result in a row; otherwise it keeps its state. A failure:
+    alive or blocked -> suspect, suspect -> down, down -> gone once it has failed for WINDOWS[0] days with a hard last
+    result or WINDOWS[1] days with any (both doubled for a "Not 24/7" row), gone stays. slots marks the UTC 3-hour
+    slots seen working since the row was last gone (D5)."""
     empty = "0" * SLOTS
     if previous is None:
         if cls in SUCCESS:
@@ -760,6 +810,7 @@ def write_state(repo: Path, state: dict[str, Record], cursor: str | None, rows: 
 class Report:
     rows: int
     fast: int
+    gone_due: int
     due: int
     taken: int
     sampled: int
@@ -775,47 +826,45 @@ def run(repo: Path, now: datetime, stop_at: float, prober: Prober, workers: int 
         lookups: int = DNS_LOOKUPS, fetch: Callable[[str], lists.Fetched] = lists.fetch) -> Report:
     """One monitor run over the repo (module docstring); raises MonitorError before writing anything it refuses."""
     started = time.monotonic()
-    rows = load_rows(pool_files(repo))
+    rows = load_rows(pool_paths(repo))
     state, cursor = read_state(repo), read_cursor(repo)
-    today = now.astimezone(timezone.utc).date()
     fast_rows = [row for row in rows.values() if row.service]
+    others = [row for row in rows.values() if not row.service]
     indexes = usable_indexes(fetch_indexes(fetch), fast_rows)
     samples = pick_samples(fast_rows, indexes, random.Random(now.isoformat()))
-    due = ring((row for row in rows.values() if not row.service), cursor, state, today)
-    done = sweep(samples + due, prober, stop_at, workers, deadline=prober.deadline, resolve=prober.resolver.warm,
+    head = samples + gone_due(others, state, now)  # probed first, outside the ring and its cursor
+    due = ring(others, cursor, state)
+    done = sweep(head + due, prober, stop_at, workers, deadline=prober.deadline, resolve=prober.resolver.warm,
                  lookups=lookups)
-    sample_classes: dict[str, list[str]] = defaultdict(list)
-    for row in samples:
-        if row.url in done.results:
-            sample_classes[row.service].append(done.results[row.url])
-    results = {row.url: done.results[row.url] for row in due if row.url in done.results}
-    results.update(fast_results(fast_rows, indexes, sample_classes))
-    taken = max(0, done.taken - len(samples))
+    results = {row.url: done.results[row.url] for row in head + due
+               if row.url in done.results and not row.service}
+    results.update(fast_results(fast_rows, indexes, samples, done.results))
+    taken = max(0, done.taken - len(head))  # ring rows taken: sweep takes rows in order, head first
     new_state = advance(state, results, rows, now)
-    write_state(repo, new_state, due[taken - 1].key if taken else cursor, rows, today)
-    return Report(rows=len(rows), fast=len(fast_rows), due=len(due), taken=taken, sampled=len(samples),
-                  indexes={s: ("used" if s in indexes else "not used") for s in FAST_SERVICES},
+    write_state(repo, new_state, due[taken - 1].key if taken else cursor, rows, now.astimezone(timezone.utc).date())
+    return Report(rows=len(rows), fast=len(fast_rows), gone_due=len(head) - len(samples), due=len(due), taken=taken,
+                  sampled=len(samples), indexes={s: ("used" if s in indexes else "not used") for s in FAST_SERVICES},
                   results=Counter(results.values()), states=Counter(r.state for r in new_state.values()),
                   changed=sum(1 for url, r in new_state.items() if state.get(url) != r), errors=done.errors,
                   seconds=round(time.monotonic() - started, 1))
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     parser = argparse.ArgumentParser(description="Probe a channel repo's pool and update monitor/state.tsv.")
     parser.add_argument("repo", type=Path)
     parser.add_argument("--budget", type=float, required=True, help="seconds from start after which no probe starts")
     parser.add_argument("--workers", type=int, default=WORKERS)
     parser.add_argument("--lookups", type=int, default=DNS_LOOKUPS, help="DNS lookups at once")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         report = run(args.repo, datetime.now(timezone.utc), started + args.budget,
                      Prober(Resolver(lookups=args.lookups)), args.workers, args.lookups)
     except MonitorError as error:
         print(f"monitor: {error}; nothing written", file=sys.stderr)
         return 1
-    print(f"in scope {report.rows} (FAST {report.fast}); ring due {report.due}, taken {report.taken}; "
-          f"FAST sample {report.sampled}; indexes {report.indexes}; {report.seconds} s")
+    print(f"in scope {report.rows} (FAST {report.fast}); gone due {report.gone_due}; ring due {report.due}, taken "
+          f"{report.taken}; FAST sample {report.sampled}; indexes {report.indexes}; {report.seconds} s")
     print(f"results {dict(report.results)}; states {dict(report.states)}; rows changed {report.changed}"
           + (f"; probe errors {dict(report.errors)}" if report.errors else ""))
     return 0
