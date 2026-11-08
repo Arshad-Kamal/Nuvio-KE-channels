@@ -32,6 +32,7 @@ jobs:
       # no token on disk while probes read untrusted answers: commit_state.sh gets it for the push alone
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          ref: main  # the tip when the job starts: a run queued behind another reads its state
           persist-credentials: false
       - name: Probe
         env:

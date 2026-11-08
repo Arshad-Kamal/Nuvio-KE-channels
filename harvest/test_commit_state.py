@@ -3,6 +3,7 @@ and never over a pool that changed during the run. Hermetic: a local bare remote
 from the machine (no identity: the script brings its own, which a rebase on a runner needs).
 Run: python3 -m unittest discover -s harvest
 """
+import base64
 import os
 import subprocess
 import tempfile
@@ -89,17 +90,40 @@ class CommitStateTest(unittest.TestCase):
         harvested = self.tip()
         done = self.run_state()
         self.assertEqual(done.returncode, 1)
-        self.assertIn("pool changed", done.stderr)
+        self.assertIn("pool or the state changed", done.stderr)
         self.assertEqual(self.tip(), harvested)
 
-    def test_a_conflict_on_the_state_files_pushes_nothing(self):
-        self.change("monitor/cursor", "fedcba9876543210\n")
+    def test_another_runs_state_on_main_pushes_nothing_even_when_it_would_merge(self):
+        self.change("monitor/state.tsv", "url\tstate\n")  # a run that read the same commit and pushed first
         other = self.tip()
-        done = self.run_state()
+        done = self.run_state(state="url\tstate\n", cursor="fedcba9876543210\n")  # no textual conflict
         self.assertEqual(done.returncode, 1)
-        self.assertIn("does not rebase", done.stderr)
+        self.assertIn("pool or the state changed", done.stderr)
         self.assertEqual(self.tip(), other)
         self.assertFalse((self.runner / ".git" / "rebase-merge").exists())
+
+    def test_the_token_reaches_git_only_as_a_github_scoped_header_in_the_environment(self):
+        shim = Path(self.directory.name) / "shim"
+        shim.mkdir()
+        real = subprocess.run(["sh", "-c", "command -v git"], env=self.env, capture_output=True, text=True,
+                              check=True).stdout.strip()
+        log = shim / "seen"
+        (shim / "git").write_text(f'#!/bin/sh\nprintf "%s|%s|%s\\n" "$GIT_CONFIG_KEY_0" "$GIT_CONFIG_VALUE_0" "$*" '
+                                  f'>> "{log}"\nexec "{real}" "$@"\n')
+        (shim / "git").chmod(0o755)
+        self.env = {**self.env, "PATH": f"{shim}:{self.env['PATH']}", "TOKEN": "s3cret-token"}
+        done = self.run_state()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        header = "AUTHORIZATION: basic " + base64.b64encode(b"x-access-token:s3cret-token").decode()
+        calls = log.read_text().splitlines()
+        self.assertTrue(calls)
+        for call in calls:
+            key, value, argv = call.split("|", 2)
+            self.assertEqual((key, value), ("http.https://github.com/.extraheader", header))
+            self.assertNotIn("s3cret", argv)
+        for text in (done.stdout, done.stderr, (self.runner / ".git" / "config").read_text()):
+            self.assertNotIn("s3cret", text)
+            self.assertNotIn(header.split()[-1], text)
 
     def test_a_checkout_other_than_origin_main_pushes_nothing(self):
         (self.runner / "harvest.py").write_text("unreviewed\n")

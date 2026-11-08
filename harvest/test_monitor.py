@@ -718,6 +718,15 @@ class MainTest(unittest.TestCase):
             self.assertEqual(monitor.main([name, "--budget", "1"]), 0)
         self.assertRegex(out.getvalue(), r"\nlookups \{'ok': 2\}; CPU \d+\.\d s; max RSS \d+ MB\n$")
 
+    def test_lookups_reach_the_resolver_and_the_run(self):
+        report = monitor.Report(rows=0, fast=0, gone_due=0, due=0, taken=0, sampled=0, indexes={}, results=Counter(),
+                                states=Counter(), changed=0, errors=Counter(), lookups=Counter(), seconds=0.0)
+        with tempfile.TemporaryDirectory() as name, mock.patch.object(monitor, "run", return_value=report) as run, \
+                mock.patch.object(monitor, "Resolver", wraps=monitor.Resolver) as resolver, redirect_stdout(StringIO()):
+            monitor.main([name, "--budget", "1", "--lookups", "3", "--workers", "5"])
+        self.assertEqual(resolver.call_args.kwargs, {"lookups": 3})
+        self.assertEqual(run.call_args.args[4:], (5, 3))
+
 
 if __name__ == "__main__":
     unittest.main()
