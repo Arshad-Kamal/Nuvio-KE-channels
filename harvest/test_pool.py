@@ -321,6 +321,7 @@ class ListsTest(unittest.TestCase):
             "UA=UA": ("-", False), "UA Chrome": ("-", False), "some UA=UA": ("-", False),
             "X-Plex-Token required": ("-", False), "Referer ftp://f.example/": ("-", False),
             "UA=Mozilla/5.0; Cookie: s=abc": ("-", False), "UA Mozilla/5.0 |Authorization=Bearer x": ("-", False),
+            "UA okhttp/4.9 Authorization Bearer 9f8e7d": ("-", False), "UA Mozilla/5.0 (x; Cookie: s=1)": ("-", False),
             "UA: Mozilla/5.0 (X11; rv:93.0) Gecko/20100101 Firefox/93.0":
                 ('{"User-Agent":"Mozilla/5.0 (X11; rv:93.0) Gecko/20100101 Firefox/93.0"}', True),
             "Referer https://a.example/; Referer https://b.example/": ('{"Referer":"https://a.example/"}', False),
@@ -955,7 +956,30 @@ class BuildPoolTest(unittest.TestCase):
         row = next(dict(zip(OUT_COLUMNS + ["channel"], line.split("\t"))) for line in written["streams.tsv"].splitlines()
                    if "/r.m3u8\t" in line)
         self.assertEqual((row["headers"], row["notes"]), ('{"Referer":"https://t.example/"}',
-                                                          "headers: Referer https://t.example/; Authorization Bearer (per-channel)"))
+                                                          "headers: a login or session header (not published)"))
+        seeds["public"][0]["headers"] = "UA otg/1.5.1 (see above)"
+        _, written = self.run_main(self.remote(), seeds)
+        self.assertIn('{"User-Agent":"otg/1.5.1"}\t-\thttps://iptv.example/r.m3u8\theaders: UA otg/1.5.1 (see above)',
+                      written["streams.tsv"])
+
+    def test_research_header_text_naming_a_session_is_not_published(self):
+        seeds = self.seeds()
+        seeds["public"][0]["headers"] = "UA=Mozilla/5.0; Cookie: s=abc"
+        _, written = self.run_main(self.remote(), seeds)
+        self.assertNotIn("s=abc", written["streams.tsv"])
+        self.assertIn("headers: a login or session header (not published)", written["streams.tsv"])
+
+    def test_a_carried_row_meets_a_join_added_during_the_outage(self):
+        m3u = '#EXTINF:-1 tvg-id="CNN.us",C\nhttps://iptv.example/live/c.m3u8\n'
+        seeds = self.seeds(research(SOURCE, bucket="public", reason="reviewed-host"))
+        with tempfile.TemporaryDirectory() as d:
+            _, before = self.run_main(self.remote(m3u=m3u), seeds, where=d)
+            remote = self.remote()  # the list fails, and iptv-org now blocklists the channel
+            remote[lists.IPTV_ORG_API + "blocklist.json"] = json.dumps(
+                BLOCKLIST + [{"channel": "CNN.us", "reason": "dmca"}]).encode()
+            _, written = self.run_main(remote, seeds, where=d)
+        self.assertIn("https://iptv.example/live/c.m3u8\t", before["streams.tsv"])
+        self.assertIn("https://iptv.example/live/c.m3u8\t", written["private.tsv"])
 
     def test_a_list_that_fails_keeps_its_last_rows(self):
         m3u = ("#EXTINF:-1,Unknown\nhttps://unreviewed.example/u.m3u8\n"

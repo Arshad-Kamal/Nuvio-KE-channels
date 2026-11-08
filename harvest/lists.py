@@ -70,9 +70,13 @@ HEADER_TEXT_KEY = re.compile(r"(?:^|[;|,])\s*(user-agent|ua|referr?er|origin)\b\
 HEADER_TEXT_NAMES = {"ua": "User-Agent", "user-agent": "User-Agent", "referer": "Referer", "referrer": "Referer",
                      "origin": "Origin"}
 # A User-Agent reads as product[/version] tokens and (comments) only, starting with a product/version ("UA=UA", "UA
-# Chrome" do not); trailing text such as "; Cookie: s=1" fails it, so another header is never published inside it.
+# Chrome" do not), and names no login or session (HEADER_SECRET): "; Cookie: s=1" or "Authorization Bearer x" after it
+# fails it.
 UA_VALUE = re.compile(r"[A-Za-z][\w.+-]*+/[\w.+-]++(?:\s++(?:[\w.+-]++(?:/[\w.+-]++)?+|\([^()]*+\)))*+")
 HTTP_URL = re.compile(r"https?://", re.IGNORECASE)
+# Words naming a login or session ("Cookie: s=1", "Authorization Bearer x", "X-Plex-Token"): such text is never read as a
+# header value nor published as written (build_pool.research_row).
+HEADER_SECRET = re.compile(r"cookie|authori[sz]ation|bearer|token|session|passw", re.IGNORECASE)
 UA_NOTE = re.compile(r"\s+(?:\([^;/()]*\)|via\s.*)$", re.IGNORECASE)  # "otg/1.5.1 (see above)", "... via EXTVLCOPT"
 NO_HEADERS = re.compile(r"(?:none|-)(?:\s+(?:listed|seen|observed|in file))?", re.IGNORECASE)
 
@@ -160,7 +164,7 @@ def _header_value(name: str, value: str) -> str | None:
     Referer/Origin: its first token when that is an http(s) URL; else None."""
     if name == "User-Agent":
         ua = UA_NOTE.sub("", value)
-        return ua if UA_VALUE.fullmatch(ua) else None
+        return ua if UA_VALUE.fullmatch(ua) and not HEADER_SECRET.search(ua) else None
     url = clean_url(value.split(" ")[0].rstrip(";|,"))
     return url if url and HTTP_URL.match(url) else None
 
@@ -301,7 +305,7 @@ def fetch(url: str) -> Fetched:
 
     threading.Thread(target=attempt, daemon=True).start()
     try:
-        result = results.get(timeout=FETCH_DEADLINE)
+        result = results.get(timeout=max(0.0, deadline - time.monotonic()))
     except queue.Empty:
         raise FetchError(f"over {FETCH_DEADLINE} s") from None
     if isinstance(result, Exception):

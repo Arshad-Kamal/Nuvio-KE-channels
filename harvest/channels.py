@@ -214,12 +214,13 @@ class Channels:
         channel's name or alt name; empty country and category cells are filled from channels.json."""
         row["channel"] = self.key(row, next((t for t in tvg_ids if self.info.get(t.split("@")[0].lower())), ""))
         named = [self.info.get(k.split("@")[0].lower()) for k in [row["channel"], *tvg_ids]]
-        neighbour = self.path_neighbour.get(_host_path(row["url"]), "")
+        path = _host_path(row["url"])
+        neighbour = self.path_neighbour.get(path, "")
         for info in filter(None, named + [self.info.get(neighbour.split("@")[0].lower())]):
             self._flag(row, info)
-        # The owner's rulings follow the channel's own URLs, never a host+path neighbour (by_path is a guess: a shared
-        # endpoint names the channel elsewhere).
-        path_keyed = row["url"] not in self.by_url and _host_path(row["url"]) in self.by_path
+        # The owner's rulings follow the channel's own URLs, never a host+path neighbour: the owner rules one channel,
+        # while iptv-org's flags (above) may demote a whole shared path, failing safe.
+        path_keyed = row["url"] not in self.by_url and path in self.by_path
         if any(_owner_nsfw(k) for k in ([] if path_keyed else [row["channel"]]) + list(tvg_ids)):
             _to_nsfw(row)
         info = named[0]
