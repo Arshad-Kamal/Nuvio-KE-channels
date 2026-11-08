@@ -35,6 +35,7 @@ import os
 import queue
 import random
 import re
+import resource
 import socket
 import ssl
 import sys
@@ -83,6 +84,7 @@ RUNS_A_WEEK = 14  # D5: two runs a day, 12 hours apart (one before 12:00 UTC, on
 STATE_FILE = Path("monitor") / "state.tsv"
 CURSOR_FILE = Path("monitor") / "cursor"
 KEY_LENGTH = 16
+EAI_NAMES = {getattr(socket, name): name for name in dir(socket) if name.startswith("EAI_")}
 
 SKIP_REASONS = ("credential", "minted", "non-http", "no-scheme", "listed")
 YOUTUBE_HOSTS = ("youtube.com", "youtu.be")
@@ -240,7 +242,8 @@ class Resolver:
     non-public address is refused (lists.public_address) and connections go to the addresses looked up here, so a
     second lookup cannot answer differently. Lookups from probes (a redirect's new host) run at most `lookups` at once,
     apart from sweep's lookup stage (warm), which its own threads bound: queued behind the stage, a probe's redirect
-    lookup ran out its deadline."""
+    lookup ran out its deadline. outcomes counts each host's answer by fixed text ("ok" or the ResolveError's), never
+    by host: the evidence for tuning `lookups` on a runner (Spec 71 M1.3)."""
 
     def __init__(self, lookup: Callable[[str], list[str]] = _lookup,
                  public: Callable[[str], bool] = lists.public_address, retry_pause: float = DNS_RETRY_PAUSE,
@@ -249,6 +252,7 @@ class Resolver:
         self._lock = threading.Lock()
         self._lookups = threading.BoundedSemaphore(lookups)
         self._answers: dict[str, tuple[threading.Event, list]] = {}
+        self.outcomes: Counter = Counter()
 
     def addresses(self, host: str, gated: bool = True) -> list[str]:
         host = host.lower()
@@ -260,7 +264,10 @@ class Resolver:
         done, answer = entry
         if first:
             try:
-                answer.append(self._resolve(host, gated))
+                found = self._resolve(host, gated)
+                answer.append(found)
+                with self._lock:
+                    self.outcomes[str(found) if isinstance(found, ResolveError) else "ok"] += 1
             except Exception as error:  # a bug: every asker gets one, so sweep counts it and records no result
                 answer.append(error)
                 raise
@@ -293,7 +300,7 @@ class Resolver:
                 if error.errno == socket.EAI_NONAME:
                     return ResolveError("gone", "no such name")
                 if error.errno != socket.EAI_AGAIN or attempt:
-                    return ResolveError("down", f"lookup failed ({error.errno})")
+                    return ResolveError("down", f"lookup failed ({EAI_NAMES.get(error.errno, error.errno)})")
                 time.sleep(self._pause)
             except (OSError, UnicodeError) as error:
                 return ResolveError("down", f"lookup failed ({type(error).__name__})")
@@ -842,6 +849,7 @@ class Report:
     states: Counter
     changed: int
     errors: Counter
+    lookups: Counter  # host lookups by outcome (Resolver.outcomes)
     seconds: float
 
 
@@ -869,7 +877,7 @@ def run(repo: Path, now: datetime, stop_at: float, prober: Prober, workers: int 
                   sampled=len(samples), indexes={s: ("used" if s in indexes else "not used") for s in FAST_SERVICES},
                   results=Counter(results.values()), states=Counter(r.state for r in new_state.values()),
                   changed=sum(1 for url, r in new_state.items() if state.get(url) != r), errors=done.errors,
-                  seconds=round(time.monotonic() - started, 1))
+                  lookups=Counter(prober.resolver.outcomes), seconds=round(time.monotonic() - started, 1))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -890,6 +898,9 @@ def main(argv: list[str] | None = None) -> int:
           f"{report.taken}; FAST sample {report.sampled}; indexes {report.indexes}; {report.seconds} s")
     print(f"results {dict(report.results)}; states {dict(report.states)}; rows changed {report.changed}"
           + (f"; probe errors {dict(report.errors)}" if report.errors else ""))
+    usage = resource.getrusage(resource.RUSAGE_SELF)  # the runner's fit (Spec 71 D6): CPU against wall time
+    print(f"lookups {dict(report.lookups)}; CPU {usage.ru_utime + usage.ru_stime:.1f} s; "
+          f"max RSS {usage.ru_maxrss // 1024} MB")
     return 0
 
 

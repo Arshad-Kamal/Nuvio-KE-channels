@@ -19,6 +19,14 @@ string (`?...`), `;` parameters or a Kodi `|` suffix is published only when iptv
   `python3 harvest/build_pool.py <this repo> <private repo>`.
 - `harvest/`: the scripts that build the candidate pool. Tests: `python3 -m unittest discover -s harvest`.
 - `harvest/reviewed-hosts.txt`: hosts reviewed for publication.
+- `monitor/state.tsv`: what the monitor (`harvest/monitor.py`, run twice a day by `.github/workflows/monitor.yml`
+  from a US runner) last found for each stream it checks, one row per URL. `state`: `alive`; `suspect` (one failed
+  check); `down` (two); `gone` (failing for 14 days with a last answer of 404/410, an unknown host or a FAST id its
+  service dropped, or 30 days of any failure; twice as long for channels iptv-org marks Not 24/7); `blocked`
+  (refused twice from the runner, which says nothing about other countries). `since`: the day the current run of
+  results began; `class`: the last result; `slots`: the UTC 3-hour slots (00-03 first) the stream has worked in.
+  FAST channels are judged by their service's channel index plus a sample of checks. `monitor/cursor`: where the
+  next run continues (each run has a time budget).
 
 The checked list the app downloads comes later.
 

@@ -13,8 +13,9 @@ import threading
 import time
 import unittest
 import urllib.request
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
+from unittest import mock
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -342,6 +343,15 @@ class ResolverTest(ServerTest):
         resolver.addresses("redirect.test")
         self.assertLess(time.monotonic() - started, 0.5)
 
+    def test_lookup_outcomes_are_counted_once_per_host_by_fixed_text(self):
+        self.prober = monitor.Prober(monitor.Resolver(self.lookup, public=lambda address: address != "10.0.0.1",
+                                                      retry_pause=0))
+        for host in ("good.test", "good.test", "nx.test", "nodata.test", "again.test", "lan.test"):
+            self.probe("/media.m3u8", host=host)
+        self.assertEqual(self.prober.resolver.outcomes,
+                         Counter({"ok": 1, "no such name": 1, "lookup failed (EAI_NODATA)": 1,
+                                  "lookup failed (EAI_AGAIN)": 1, "not a public address": 1}))
+
     def test_each_host_is_looked_up_once_per_run(self):
         for path in ("/master.m3u8", "/media.m3u8", "/video"):
             self.probe(path)
@@ -665,6 +675,7 @@ class RunTest(ServerTest):
                               fast: ("suspect", "gone")})
             self.assertEqual(state[urls[0]].slots, "01000000")
             self.assertEqual((report.taken, report.due, report.sampled), (3, 3, 1))
+            self.assertEqual(report.lookups, Counter({"ok": 1, "no such name": 1}))  # good.test, the sample's host
             self.assertEqual(monitor.read_cursor(repo), max(monitor.ring_key(u) for u in urls))
 
             report = monitor.run(repo, first + timedelta(hours=12), time.monotonic() + 10, self.prober,
@@ -695,6 +706,17 @@ class RunTest(ServerTest):
             monitor.run(repo, due + timedelta(hours=12), time.monotonic() - 1, self.prober, fetch=fetch)
             self.assertEqual(monitor.read_state(repo), state)
             self.assertEqual(monitor.read_cursor(repo), cursor)
+
+
+class MainTest(unittest.TestCase):
+    def test_the_run_prints_aggregates_with_lookups_cpu_and_memory(self):
+        report = monitor.Report(rows=3, fast=1, gone_due=0, due=2, taken=2, sampled=1, indexes={}, results=Counter(),
+                                states=Counter(), changed=0, errors=Counter(), lookups=Counter({"ok": 2}),
+                                seconds=1.0)
+        with tempfile.TemporaryDirectory() as name, mock.patch.object(monitor, "run", return_value=report), \
+                redirect_stdout(StringIO()) as out:
+            self.assertEqual(monitor.main([name, "--budget", "1"]), 0)
+        self.assertRegex(out.getvalue(), r"\nlookups \{'ok': 2\}; CPU \d+\.\d s; max RSS \d+ MB\n$")
 
 
 if __name__ == "__main__":

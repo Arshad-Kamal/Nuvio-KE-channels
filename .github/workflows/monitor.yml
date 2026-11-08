@@ -1,0 +1,45 @@
+# Probes the pool and commits monitor/state.tsv and monitor/cursor (harvest/monitor.py; Nuvio-Project Spec 71).
+# Free and unlimited here on standard runners; never a larger runner (they bill even in public repos).
+name: Monitor
+
+on:
+  workflow_dispatch:
+    inputs:
+      budget:
+        description: Seconds after which no probe starts (empty = the scheduled value)
+        type: number
+      lookups:
+        description: DNS lookups at once (empty = the scheduled value)
+        type: number
+      commit:
+        description: Commit the state (off for a measuring run, which then leaves the cursor where it was)
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45  # just above the budget; a killed run commits nothing
+    permissions:
+      contents: write
+    steps:
+      # no token on disk while probes read untrusted answers: commit_state.sh gets it for the push alone
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Probe
+        env:
+          BUDGET: ${{ inputs.budget || 2400 }}
+          LOOKUPS: ${{ inputs.lookups || 8 }}
+        run: python3 harvest/monitor.py . --budget="$BUDGET" --lookups="$LOOKUPS"
+      - name: Commit
+        if: github.event_name != 'workflow_dispatch' || inputs.commit
+        env:
+          TOKEN: ${{ github.token }}
+        run: sh harvest/commit_state.sh .
