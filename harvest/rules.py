@@ -321,7 +321,7 @@ def has_parameters(url: str) -> bool:
                                                      for mark in (b";", b"?", b"|"))
 
 
-def _listed_source(source: str) -> str | None:
+def listed_source(source: str) -> str | None:
     """The PRIVATE_HOSTS entry a row's source page matches: rows copied from a listed pirate list stay private."""
     lowered = source.lower()
     return next((host for host, pattern in zip(PRIVATE_HOSTS, _HOST_PATTERNS) if pattern.search(lowered)), None)
@@ -368,7 +368,7 @@ def private_faults(row: Mapping[str, str], listed_by_iptv_org: bool) -> Iterator
         yield Verdict("private", "drm")
     if not listed_by_iptv_org and (token_shaped(url) or (stream and MINTED_NOTES.search(row["notes"]))):
         yield Verdict("private", "minted")
-    listed = _listed_source(row["source_page"])
+    listed = listed_source(row["source_page"])
     if listed:
         yield Verdict("private", f"listed:{listed}", copy_only=True)
     # Every other published cell: a credential or token written into any of them is published too. A list's notes

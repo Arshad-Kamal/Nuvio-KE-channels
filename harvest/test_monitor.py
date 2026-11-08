@@ -93,6 +93,12 @@ ROUTES = {
     "/aesseg.m3u8": (200, HLS, media("cipher"), {}),
     "/cipher": (200, "video/mp2t", b"{\x8a\x13" + bytes(range(256)) * 4, {}),  # AES-128 ciphertext: random bytes
     "/utf16": (200, "text/html", "<html>gone</html>".encode("utf-16"), {}),
+    "/aestext.m3u8": (200, HLS, media("ciphertext"), {}),
+    "/ciphertext": (200, "text/vnd.trolltech.linguist", b"\x8a\x13" + bytes(range(256)) * 4, {}),
+    "/plainseg.m3u8": (200, HLS, media("plain"), {}),
+    "/plain": (200, "application/octet-stream", b"Forbidden: this content is not available here", {}),
+    "/jsonseg.m3u8": (200, HLS, media("json"), {}),
+    "/json": (200, "video/mp2t", b'\xef\xbb\xbf{\n  "error": "geo"}', {}),
     # Cut at the cap inside its last line: dropping that line makes seg2.ts (ok) the segment three from the end; keeping
     # it would pick "missing" (down).
     "/cut.m3u8": (200, HLS, media("seg2.ts") + b"#EXTINF:6,\nmissing\n#EXTINF:6,\nseg2.ts\n#EXTINF:6,\n"
@@ -213,6 +219,9 @@ class ProbeClassTest(ServerTest):
         self.assertEqual(self.probe("/htmlseg.m3u8"), "blocked")
         self.assertEqual(self.probe("/textseg.m3u8"), "ok")
         self.assertEqual(self.probe("/aesseg.m3u8"), "ok")
+        self.assertEqual(self.probe("/aestext.m3u8"), "ok")  # ciphertext under a text type: bytes decide
+        self.assertEqual(self.probe("/plainseg.m3u8"), "blocked")
+        self.assertEqual(self.probe("/jsonseg.m3u8"), "blocked")  # a BOM and pretty-printed JSON
 
     def test_a_utf16_page_is_not_audio(self):
         self.assertEqual(self.probe("/utf16"), "down")
@@ -284,9 +293,10 @@ class ResolverTest(ServerTest):
             raise KeyError(host)
 
         resolver = monitor.Resolver(lookup, public=lambda address: True)
-        for _ in range(2):
-            with self.assertRaises((KeyError, RuntimeError)):
-                resolver.addresses("bug.test")
+        with self.assertRaises(KeyError):
+            resolver.addresses("bug.test")  # the first asker: the bug itself
+        with self.assertRaises(RuntimeError):
+            resolver.addresses("bug.test")  # later askers: a fresh exception, never the shared one
         prober = monitor.Prober(monitor.Resolver(lookup, public=lambda address: True))
         done = monitor.sweep([row(self.url("/video", "bug.test"))], prober, time.monotonic() + 10,
                              resolve=prober.resolver.warm)
@@ -656,12 +666,11 @@ class RunTest(ServerTest):
             state[gone_url] = Record("gone", first.date() - timedelta(days=40), "gone", "00000000")
             monitor.write_state(repo, state, cursor, monitor.load_rows(monitor.pool_paths(repo)), first.date())
             key = int(monitor.ring_key(gone_url), 16) % monitor.RUNS_A_WEEK
-            runs = [first + timedelta(hours=12 * n) for n in range(2, 16)]
-            due = next(r for r in runs if monitor.run_slot(r) == key)
-            other = next((r for r in runs if r < due), None)
-            if other is not None:
-                monitor.run(repo, other, time.monotonic() + 10, self.prober, fetch=fetch)
-                self.assertEqual(monitor.read_state(repo)[gone_url].state, "gone")
+            runs = [first + timedelta(hours=12 * n) for n in range(2, 30)]
+            due = [r for r in runs if monitor.run_slot(r) == key][1]  # the second week's: other runs precede it
+            other = next(r for r in runs if monitor.run_slot(r) != key)
+            monitor.run(repo, other, time.monotonic() + 10, self.prober, fetch=fetch)
+            self.assertEqual(monitor.read_state(repo)[gone_url].state, "gone")
             report = monitor.run(repo, due, time.monotonic() + 10, self.prober, fetch=fetch)
             self.assertEqual((report.gone_due, report.due, report.taken), (1, 2, 2))
             self.assertEqual(monitor.read_state(repo)[gone_url].state, "alive")
@@ -669,7 +678,7 @@ class RunTest(ServerTest):
             state, cursor = monitor.read_state(repo), monitor.read_cursor(repo)
 
             # the budget already spent: nothing probed, the sample cut short, nothing changes
-            monitor.run(repo, first + timedelta(days=9), time.monotonic() - 1, self.prober, fetch=fetch)
+            monitor.run(repo, due + timedelta(hours=12), time.monotonic() - 1, self.prober, fetch=fetch)
             self.assertEqual(monitor.read_state(repo), state)
             self.assertEqual(monitor.read_cursor(repo), cursor)
 

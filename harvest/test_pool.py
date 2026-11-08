@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 import build_pool
+from rules import Verdict
 import egress
 import extract_research
 import lists
@@ -922,8 +923,12 @@ class BuildPoolTest(unittest.TestCase):
         body = "#EXTINF:-1,Late Night\nhttps://iptv.example/live/x.m3u8\n"
         nsfw = research(SOURCE, bucket="nsfw", reason="nsfw")  # NSFW by its name: the URL matches no rule
         self.assertEqual(self.buckets(self.seeds(nsfw), body)["https://iptv.example/live/x.m3u8"], "nsfw.tsv")
-        listed = research(SOURCE, reason="listed:bplaytv/")  # listed by its source page: the URL is clean
-        self.assertEqual(self.buckets(self.seeds(listed), body)["https://iptv.example/live/x.m3u8"], "private.tsv")
+        # Listed by its source page, fetched from a URL no PRIVATE_HOSTS entry matches: refused (Spec 71 D9), since an
+        # unreviewed-host verdict would outrank the copy-only taint and the monitor could fetch its rows.
+        remote = self.remote()
+        remote[SOURCE] = body.encode()
+        code, written = self.run_main(remote, self.seeds(research(SOURCE, reason="listed:bplaytv/")))
+        self.assertEqual((code, written), (1, {}))
         self.assertEqual(self.buckets(self.seeds(research(SOURCE, bucket="public", reason="reviewed-host")), body)
                          ["https://iptv.example/live/x.m3u8"], "streams.tsv")
 
@@ -1030,3 +1035,17 @@ class BuildPoolTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ListedUncoveredTest(unittest.TestCase):
+    """Spec 71 D9: a research-listed list must be fetched from a URL PRIVATE_HOSTS matches."""
+
+    def test_a_listed_list_fetched_from_an_unmatched_url_is_refused(self):
+        taints = {"https://lists.example/a.m3u": Verdict("private", "listed:zokerpunk", copy_only=True),
+                  "https://lists.example/b.m3u": Verdict("nsfw", "nsfw")}
+        pulls = [{"url": "https://lists.example/a.m3u", "fetched": "https://cdn.example/a.m3u", "rows": "3"},
+                 {"url": "https://lists.example/a.m3u", "fetched": "https://raw.githubusercontent.com/zokerpunk/a.m3u",
+                  "rows": "3"},
+                 {"url": "https://lists.example/b.m3u", "fetched": "https://cdn.example/b.m3u", "rows": "3"},
+                 {"url": "https://lists.example/a.m3u", "fetched": "-", "rows": "0"}]
+        self.assertEqual(build_pool.listed_uncovered(pulls, taints), pulls[:1])

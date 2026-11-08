@@ -9,10 +9,11 @@ it reads the pool and writes only monitor/state.tsv (url, state, since, class, s
 server sent is written: cells are enums, dates and slot bits, every URL must be an in-scope pool URL, and a run that
 breaks any of that writes nothing (exit 1). Output is aggregate counts, never a URL.
 
-Scope (Spec 71 D2, D7, D8): http(s) only, no YouTube host, and no credential, minted, non-http or listed fault, read
-from every fault rules.private_faults finds in the row, not only from its reason (a merged row's reason names one:
-nsfw or drm hides a listed source or a minted provenance). A listed host or list is rules.py's only defence against
-Xtream's short-form credential URLs (D17, D8).
+Scope (Spec 71 D2, D7, D8): http(s) only, no YouTube host, no credential, minted, non-http or listed reason, and no
+fault rules.private_faults finds in the row but drm (D2 probes DRM rows), whatever its reason (a merged row's reason
+names one: nsfw or drm hides a listed source or a minted provenance); a fault reason added later skips by default.
+A listed host or list is rules.py's only defence against Xtream's short-form credential URLs (D17, D8); build_pool
+refuses a listed list its rows could not show (D9).
 
 FAST rows (D1): a jmp2.uk or i.mjh.nz URL naming a Pluto/Samsung/Roku/Plex channel is judged by its service's index
 (listed / unlisted), plus a sample of US rows probed each run (fast_results); it is never probed in the ring.
@@ -101,9 +102,11 @@ DECOY_URL = re.compile(r"video_no_available", re.IGNORECASE)  # RAI's geo slate 
 BLOCK_PAGE = re.compile(rb"access denied.{0,4000}?reference(?:\s|&#32;)*(?:#|&#35;)|block access from your country|"
                         rb"error\s*(?:code:?\s*)?1009", re.IGNORECASE | re.DOTALL)
 FMP4_BOXES = (b"ftyp", b"styp", b"moof", b"sidx")
-# How a page, JSON or playlist starts (lowercased, after whitespace): several bytes, so AES-128 ciphertext, whose first
-# byte is random, never reads as text.
-TEXT_START = (b"<!", b"<?xml", b"<html", b"<head", b"<body", b"#extm3u", b'{"')
+# A body is text when its start (after a UTF-8 BOM and whitespace, lowercased) is a page or playlist opening, JSON, or
+# all printable ASCII: several bytes each, so AES-128 ciphertext (random bytes) never reads as text, whatever its type.
+TEXT_START = (b"<!", b"<?xml", b"<html", b"<head", b"<body", b"<h1", b"<title", b"<script", b"<error", b"#extm3u")
+JSON_START = re.compile(rb'[\[{]\s*["\[{]')
+TEXT_PROBE = 64
 
 
 class MonitorError(Exception):
@@ -182,7 +185,7 @@ def scoped(row: dict[str, str]) -> Row | None:
         return None
     listed_by_iptv_org = "iptv-org" in row["seen_in"].split(",")  # the merged row holds iptv-org's copy
     if not host or has_suffix(host, YOUTUBE_HOSTS) or any(
-            _skipped(fault.reason) for fault in private_faults(row, listed_by_iptv_org)):
+            fault.reason != "drm" for fault in private_faults(row, listed_by_iptv_org)):
         return None
     pid = provider_id(url)
     service = pid.split(":")[0] if pid else None
@@ -399,22 +402,23 @@ def _media_bytes(body: bytes) -> bool:
             or body[:3] == b"ID3" or (len(body) > 1 and body[0] == 0xFF and body[1] & 0xF6 == 0xF0))
 
 
-def _text_shaped(answer: Answer) -> bool:
-    return (answer.content_type.startswith(("text/", "application/json"))
-            or answer.body.lstrip()[:8].lower().startswith(TEXT_START))
+def _text_shaped(body: bytes) -> bool:
+    head = body.lstrip(b"\xef\xbb\xbf \t\r\n")[:TEXT_PROBE].lower()
+    return bool(head) and (head.startswith(TEXT_START) or bool(JSON_START.match(head))
+                           or all(32 <= byte < 127 or byte in b"\t\r\n" for byte in head))
 
 
 def _is_text(answer: Answer) -> bool:
-    """A page, JSON or playlist rather than media. Media bytes win over the content type: servers label .ts files
+    """A page, JSON, playlist or plain-text error rather than media, judged on the bytes: servers label .ts files
     text/vnd.trolltech.linguist."""
-    return not _media_bytes(answer.body) and _text_shaped(answer)
+    return not _media_bytes(answer.body) and _text_shaped(answer.body)
 
 
 def _is_media(answer: Answer) -> bool:
     """An audio/video answer: media bytes, or a non-text body under an AV content type (not audio/x-mpegurl)."""
     kind = answer.content_type
     return _media_bytes(answer.body) or (kind.startswith(("video/", "audio/")) and "mpegurl" not in kind
-                                         and bool(answer.body) and not _text_shaped(answer))
+                                         and bool(answer.body) and not _text_shaped(answer.body))
 
 
 class Prober:
