@@ -15,7 +15,6 @@ from pathlib import Path
 from unittest import mock
 
 import build_pool
-from rules import Verdict
 import egress
 import extract_research
 import lists
@@ -1033,19 +1032,21 @@ class BuildPoolTest(unittest.TestCase):
         self.assertEqual(self.run_main(self.remote(), self.seeds(), ips=None), (1, {}))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ListedUncoveredTest(unittest.TestCase):
     """Spec 71 D9: a research-listed list must be fetched from a URL PRIVATE_HOSTS matches."""
 
     def test_a_listed_list_fetched_from_an_unmatched_url_is_refused(self):
-        taints = {"https://lists.example/a.m3u": Verdict("private", "listed:zokerpunk", copy_only=True),
-                  "https://lists.example/b.m3u": Verdict("nsfw", "nsfw")}
-        pulls = [{"url": "https://lists.example/a.m3u", "fetched": "https://cdn.example/a.m3u", "rows": "3"},
-                 {"url": "https://lists.example/a.m3u", "fetched": "https://raw.githubusercontent.com/zokerpunk/a.m3u",
-                  "rows": "3"},
-                 {"url": "https://lists.example/b.m3u", "fetched": "https://cdn.example/b.m3u", "rows": "3"},
-                 {"url": "https://lists.example/a.m3u", "fetched": "-", "rows": "0"}]
-        self.assertEqual(build_pool.listed_uncovered(pulls, taints), pulls[:1])
+        blob = "https://github.com/someone/lists/blob/main/a.m3u"
+        research_lists = [{"url": blob, "reason": "nsfw"}, {"url": blob, "reason": "listed:zokerpunk"},
+                          {"url": "https://lists.example/b.m3u", "reason": "-"}]
+        raw = "https://raw.githubusercontent.com/someone/lists/main/a.m3u"
+        pulls = [{"url": blob, "fetched": raw, "rows": "3"},
+                 {"url": blob, "fetched": "https://raw.githubusercontent.com/zokerpunk/a.m3u", "rows": "3"},
+                 {"url": "https://lists.example/b.m3u", "fetched": "https://lists.example/b.m3u", "rows": "3"},
+                 {"url": blob, "fetched": "-", "rows": "0"}]
+        self.assertEqual(build_pool.listed_uncovered(pulls, research_lists), pulls[:1])
+
+
+if __name__ == "__main__":
+    unittest.main()
+

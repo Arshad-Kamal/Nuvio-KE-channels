@@ -103,7 +103,7 @@ BLOCK_PAGE = re.compile(rb"access denied.{0,4000}?reference(?:\s|&#32;)*(?:#|&#3
                         rb"error\s*(?:code:?\s*)?1009", re.IGNORECASE | re.DOTALL)
 FMP4_BOXES = (b"ftyp", b"styp", b"moof", b"sidx")
 # A body is text when its start (after a UTF-8 BOM and whitespace, lowercased) is a page or playlist opening, JSON, or
-# all printable ASCII: several bytes each, so AES-128 ciphertext (random bytes) never reads as text, whatever its type.
+# printable UTF-8: several bytes each, so AES-128 ciphertext (random bytes) never reads as text, whatever its type.
 TEXT_START = (b"<!", b"<?xml", b"<html", b"<head", b"<body", b"<h1", b"<title", b"<script", b"<error", b"#extm3u")
 JSON_START = re.compile(rb'[\[{]\s*["\[{]')
 TEXT_PROBE = 64
@@ -397,15 +397,26 @@ def _is_block_page(answer: Answer) -> bool:
 
 
 def _media_bytes(body: bytes) -> bool:
-    """Two MPEG-TS packets, an fMP4 box, ID3-tagged or ADTS audio (sync 0xFFF, layer 00: a UTF-16 BOM, FF FE, is not)."""
+    """Two MPEG-TS packets, an fMP4 box, ID3-tagged or ADTS audio (sync 0xFFF, layer 00: a UTF-16 BOM, FF FE, is
+    not)."""
     return ((len(body) > 188 and body[0] == 0x47 and body[188] == 0x47) or body[4:8] in FMP4_BOXES
             or body[:3] == b"ID3" or (len(body) > 1 and body[0] == 0xFF and body[1] & 0xF6 == 0xF0))
 
 
 def _text_shaped(body: bytes) -> bool:
     head = body.lstrip(b"\xef\xbb\xbf \t\r\n")[:TEXT_PROBE].lower()
-    return bool(head) and (head.startswith(TEXT_START) or bool(JSON_START.match(head))
-                           or all(32 <= byte < 127 or byte in b"\t\r\n" for byte in head))
+    return bool(head) and (head.startswith(TEXT_START) or bool(JSON_START.match(head)) or _printable(head))
+
+
+def _printable(head: bytes) -> bool:
+    """Whether the bytes are printable UTF-8 text (a character cut at the end of the probe allowed)."""
+    for cut in range(4):
+        try:
+            text = head[:len(head) - cut].decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        return bool(text) and all(char.isprintable() or char in "\t\r\n" for char in text)
+    return False
 
 
 def _is_text(answer: Answer) -> bool:
@@ -499,7 +510,7 @@ class Prober:
             return "down"
         segment = self._get(_join(answer.final_url, segments[max(0, len(segments) - 3)]), headers, deadline,
                             first=False, segment=True)
-        if not segment.body:
+        if not segment.body.strip(b"\xef\xbb\xbf \t\r\n"):
             return "down"
         return "blocked" if _is_text(segment) else "ok"
 

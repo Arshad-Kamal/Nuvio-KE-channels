@@ -147,13 +147,14 @@ def pull_lists(research_lists: list[dict], taints: dict[str, Verdict | None], pr
     return [record for record, _ in results], pulled
 
 
-def listed_uncovered(pulls: list[dict], taints: dict[str, Verdict | None]) -> list[dict]:
-    """Pull records of lists the research marks listed whose fetched URL no PRIVATE_HOSTS entry matches. Their rows
+def listed_uncovered(pulls: list[dict], research_lists: list[dict]) -> list[dict]:
+    """Pull records of lists any research row marks listed whose fetched URL no PRIVATE_HOSTS entry matches. Their rows
     would carry the listed taint only as a copy-only verdict, which a stream-level private verdict (unreviewed-host)
-    outranks, so no pool cell would keep the channel monitor from fetching them (Spec 71 D9: the run is refused)."""
+    outranks and a stricter nsfw taint replaces, so no pool cell would keep the channel monitor from fetching them
+    (Spec 71 D9: the run is refused)."""
+    listed = {lists.list_url(row["url"]) for row in research_lists if row["reason"].startswith("listed:")}
     return [record for record in pulls if record["fetched"] != "-" and record["rows"] != "0"
-            and (taint := taints.get(lists.list_url(record["url"]))) is not None and taint.reason.startswith("listed:")
-            and listed_source(record["fetched"]) is None]
+            and lists.list_url(record["url"]) in listed and listed_source(record["fetched"]) is None]
 
 
 def research_seeds(private: Path) -> list[dict[str, str]]:
@@ -204,9 +205,9 @@ def main() -> int:
     research_lists = [row for row in seeds if row["kind"] in LIST_KINDS]
     taints = lists.list_taints(research_lists)
     pulls, pulled = pull_lists(research_lists, taints, previous_run(args.public, args.private))
-    if uncovered := listed_uncovered(pulls, taints):
-        print(f"refused: {len(uncovered)} research-listed list(s) fetched from a URL no rules.PRIVATE_HOSTS entry matches;"
-              " add one (Spec 71 D9)", file=sys.stderr)
+    if uncovered := listed_uncovered(pulls, research_lists):
+        print(f"refused: {len(uncovered)} research-listed list(s) fetched from a URL no rules.PRIVATE_HOSTS entry"
+              " matches; add one (Spec 71 D9)", file=sys.stderr)
         return 1
 
     def copies():

@@ -99,6 +99,15 @@ ROUTES = {
     "/plain": (200, "application/octet-stream", b"Forbidden: this content is not available here", {}),
     "/jsonseg.m3u8": (200, HLS, media("json"), {}),
     "/json": (200, "video/mp2t", b'\xef\xbb\xbf{\n  "error": "geo"}', {}),
+    "/blankseg.m3u8": (200, HLS, media("blank"), {}),
+    "/blank": (200, "video/mp2t", b"\r\n \r\n", {}),
+    "/nonascii.m3u8": (200, HLS, media("nonascii"), {}),
+    "/nonascii": (200, "video/mp2t", "<p>Acceso denegado \u2013 contenido no disponible</p>".encode(), {}),
+    "/tagseg.m3u8": (200, HLS, media("tag"), {}),
+    "/tag": (200, "video/mp2t", "<title>\u0414\u043e\u0441\u0442\u0443\u043f \u0437\u0430\u043f\u0440\u0435"
+                                "\u0449\u0435\u043d\u00a0\x01".encode(), {}),
+    "/jsonarr.m3u8": (200, HLS, media("jsonarr"), {}),
+    "/jsonarr": (200, "video/mp2t", b'[ {"error": "\xd0\x94\x01"}]', {}),
     # Cut at the cap inside its last line: dropping that line makes seg2.ts (ok) the segment three from the end; keeping
     # it would pick "missing" (down).
     "/cut.m3u8": (200, HLS, media("seg2.ts") + b"#EXTINF:6,\nmissing\n#EXTINF:6,\nseg2.ts\n#EXTINF:6,\n"
@@ -222,6 +231,10 @@ class ProbeClassTest(ServerTest):
         self.assertEqual(self.probe("/aestext.m3u8"), "ok")  # ciphertext under a text type: bytes decide
         self.assertEqual(self.probe("/plainseg.m3u8"), "blocked")
         self.assertEqual(self.probe("/jsonseg.m3u8"), "blocked")  # a BOM and pretty-printed JSON
+        self.assertEqual(self.probe("/nonascii.m3u8"), "blocked")  # printable UTF-8, no known opening
+        self.assertEqual(self.probe("/tagseg.m3u8"), "blocked")  # a known opening, then a control byte
+        self.assertEqual(self.probe("/jsonarr.m3u8"), "blocked")  # a JSON array, then a control byte
+        self.assertEqual(self.probe("/blankseg.m3u8"), "down")  # only whitespace: no media
 
     def test_a_utf16_page_is_not_audio(self):
         self.assertEqual(self.probe("/utf16"), "down")
@@ -549,7 +562,8 @@ class ScopeTest(unittest.TestCase):
         self.assertIsNone(monitor.scoped(self.pool_row("https://cdn.example/a.m3u8", source_page=listed_list)))
         self.assertIsNone(monitor.scoped(self.pool_row("https://cdn.example/a.m3u8", reason="drm",
                                                        source_page="https://broadcaster.example/api/live")))
-        self.assertIsNotNone(monitor.scoped(self.pool_row("https://cdn.example/a.m3u8", reason="drm")))
+        self.assertIsNotNone(monitor.scoped(self.pool_row("https://cdn.example/a.m3u8", reason="drm",
+                                                          notes="license_url (DRM)")))  # D2 probes a drm fault
 
     def test_a_token_url_iptv_org_lists_is_probed(self):
         found = monitor.scoped(self.pool_row("https://cdn.example/live.m3u8?token=abc", reason="iptv-org-url",
