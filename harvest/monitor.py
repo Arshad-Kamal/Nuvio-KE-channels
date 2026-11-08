@@ -101,6 +101,9 @@ DECOY_URL = re.compile(r"video_no_available", re.IGNORECASE)  # RAI's geo slate 
 BLOCK_PAGE = re.compile(rb"access denied.{0,4000}?reference(?:\s|&#32;)*(?:#|&#35;)|block access from your country|"
                         rb"error\s*(?:code:?\s*)?1009", re.IGNORECASE | re.DOTALL)
 FMP4_BOXES = (b"ftyp", b"styp", b"moof", b"sidx")
+# How a page, JSON or playlist starts (lowercased, after whitespace): several bytes, so AES-128 ciphertext, whose first
+# byte is random, never reads as text.
+TEXT_START = (b"<!", b"<?xml", b"<html", b"<head", b"<body", b"#extm3u", b'{"')
 
 
 class MonitorError(Exception):
@@ -258,16 +261,20 @@ class Resolver:
         if first:
             try:
                 answer.append(self._resolve(host, gated))
-            except Exception as error:  # a bug: every asker gets it, so sweep counts it and records no result
+            except Exception as error:  # a bug: every asker gets one, so sweep counts it and records no result
                 answer.append(error)
                 raise
             finally:
                 done.set()
         else:
             done.wait()
-        if isinstance(answer[0], Exception):
-            raise answer[0]
-        return answer[0]
+        stored = answer[0]
+        # a fresh exception per asker: one shared instance would grow its traceback with every raise
+        if isinstance(stored, ResolveError):
+            raise ResolveError(stored.cls, str(stored))
+        if isinstance(stored, Exception):
+            raise RuntimeError(f"lookup raised {type(stored).__name__}")
+        return stored
 
     def warm(self, host: str) -> None:
         """Looks the host up now (sweep's lookup stage); a failure waits in the cache for the probe."""
@@ -390,23 +397,27 @@ def _is_block_page(answer: Answer) -> bool:
 
 
 def _media_bytes(body: bytes) -> bool:
-    """Two MPEG-TS packets, an fMP4 box, ID3-tagged or ADTS/MPEG audio."""
+    """Two MPEG-TS packets, an fMP4 box, ID3-tagged or ADTS audio (sync 0xFFF, layer 00: a UTF-16 BOM, FF FE, is not)."""
     return ((len(body) > 188 and body[0] == 0x47 and body[188] == 0x47) or body[4:8] in FMP4_BOXES
-            or body[:3] == b"ID3" or (len(body) > 1 and body[0] == 0xFF and body[1] & 0xF0 == 0xF0))
+            or body[:3] == b"ID3" or (len(body) > 1 and body[0] == 0xFF and body[1] & 0xF6 == 0xF0))
+
+
+def _text_shaped(answer: Answer) -> bool:
+    return (answer.content_type.startswith(("text/", "application/json"))
+            or answer.body.lstrip()[:8].lower().startswith(TEXT_START))
 
 
 def _is_text(answer: Answer) -> bool:
     """A page, JSON or playlist rather than media. Media bytes win over the content type: servers label .ts files
     text/vnd.trolltech.linguist."""
-    return not _media_bytes(answer.body) and (answer.content_type.startswith(("text/", "application/json"))
-                                              or answer.body.lstrip()[:1] in (b"<", b"{", b"#"))
+    return not _media_bytes(answer.body) and _text_shaped(answer)
 
 
 def _is_media(answer: Answer) -> bool:
     """An audio/video answer: media bytes, or a non-text body under an AV content type (not audio/x-mpegurl)."""
     kind = answer.content_type
     return _media_bytes(answer.body) or (kind.startswith(("video/", "audio/")) and "mpegurl" not in kind
-                                         and bool(answer.body) and not _is_text(answer))
+                                         and bool(answer.body) and not _text_shaped(answer))
 
 
 class Prober:
@@ -832,17 +843,17 @@ def run(repo: Path, now: datetime, stop_at: float, prober: Prober, workers: int 
     others = [row for row in rows.values() if not row.service]
     indexes = usable_indexes(fetch_indexes(fetch), fast_rows)
     samples = pick_samples(fast_rows, indexes, random.Random(now.isoformat()))
-    head = samples + gone_due(others, state, now)  # probed first, outside the ring and its cursor
+    gone = gone_due(others, state, now)
+    head = samples + gone  # probed first, outside the ring and its cursor
     due = ring(others, cursor, state)
     done = sweep(head + due, prober, stop_at, workers, deadline=prober.deadline, resolve=prober.resolver.warm,
                  lookups=lookups)
-    results = {row.url: done.results[row.url] for row in head + due
-               if row.url in done.results and not row.service}
+    results = {row.url: done.results[row.url] for row in gone + due if row.url in done.results}
     results.update(fast_results(fast_rows, indexes, samples, done.results))
     taken = max(0, done.taken - len(head))  # ring rows taken: sweep takes rows in order, head first
     new_state = advance(state, results, rows, now)
     write_state(repo, new_state, due[taken - 1].key if taken else cursor, rows, now.astimezone(timezone.utc).date())
-    return Report(rows=len(rows), fast=len(fast_rows), gone_due=len(head) - len(samples), due=len(due), taken=taken,
+    return Report(rows=len(rows), fast=len(fast_rows), gone_due=len(gone), due=len(due), taken=taken,
                   sampled=len(samples), indexes={s: ("used" if s in indexes else "not used") for s in FAST_SERVICES},
                   results=Counter(results.values()), states=Counter(r.state for r in new_state.values()),
                   changed=sum(1 for url, r in new_state.items() if state.get(url) != r), errors=done.errors,

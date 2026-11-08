@@ -89,6 +89,9 @@ ROUTES = {
     "/blockvariant.m3u8": (200, HLS, master("akamai"), {}),
     "/textseg.m3u8": (200, HLS, media("textts"), {}),
     "/textts": (200, "text/vnd.trolltech.linguist", TS, {}),
+    "/aesseg.m3u8": (200, HLS, media("cipher"), {}),
+    "/cipher": (200, "video/mp2t", b"{\x8a\x13" + bytes(range(256)) * 4, {}),  # AES-128 ciphertext: random bytes
+    "/utf16": (200, "text/html", "<html>gone</html>".encode("utf-16"), {}),
     # Cut at the cap inside its last line: dropping that line makes seg2.ts (ok) the segment three from the end; keeping
     # it would pick "missing" (down).
     "/cut.m3u8": (200, HLS, media("seg2.ts") + b"#EXTINF:6,\nmissing\n#EXTINF:6,\nseg2.ts\n#EXTINF:6,\n"
@@ -208,6 +211,10 @@ class ProbeClassTest(ServerTest):
     def test_a_text_segment_is_blocked_but_media_bytes_win_over_a_text_type(self):
         self.assertEqual(self.probe("/htmlseg.m3u8"), "blocked")
         self.assertEqual(self.probe("/textseg.m3u8"), "ok")
+        self.assertEqual(self.probe("/aesseg.m3u8"), "ok")
+
+    def test_a_utf16_page_is_not_audio(self):
+        self.assertEqual(self.probe("/utf16"), "down")
 
     def test_an_html_variant_is_down_unless_it_names_a_block(self):
         self.assertEqual(self.probe("/htmlvariant.m3u8"), "down")
@@ -270,6 +277,19 @@ class ResolverTest(ServerTest):
         handler = next(h for h in monitor.opener(resolver).handlers if isinstance(h, urllib.request.HTTPSHandler))
         connection = handler._connection("good.test", timeout=1, context=handler._context)
         self.assertEqual(connection._create_connection, resolver.connect)
+
+    def test_a_lookup_bug_reaches_every_asker_and_gives_no_result(self):
+        def lookup(host):
+            raise KeyError(host)
+
+        resolver = monitor.Resolver(lookup, public=lambda address: True)
+        for _ in range(2):
+            with self.assertRaises((KeyError, RuntimeError)):
+                resolver.addresses("bug.test")
+        prober = monitor.Prober(monitor.Resolver(lookup, public=lambda address: True))
+        done = monitor.sweep([row(self.url("/video", "bug.test"))], prober, time.monotonic() + 10,
+                             resolve=prober.resolver.warm)
+        self.assertEqual((done.results, done.errors), ({}, Counter({"RuntimeError": 1})))
 
     def test_concurrent_askers_share_one_lookup(self):
         lookup = FakeLookup()
@@ -374,6 +394,11 @@ class RingTest(unittest.TestCase):
         rows = sorted((row(f"http://a.test/{i}") for i in range(5)), key=lambda r: r.key)
         self.assertEqual(monitor.ring(rows, None, {}), rows)
         self.assertEqual(monitor.ring(rows, rows[1].key, {}), rows[2:] + rows[:2])
+
+    def test_run_slot_counts_two_runs_a_day(self):
+        morning = datetime(2026, 11, 8, 3, 17, tzinfo=timezone.utc)
+        slots = [monitor.run_slot(morning + timedelta(hours=12 * n)) for n in range(14)]
+        self.assertEqual(sorted(slots), list(range(14)))
 
     def test_gone_rows_leave_the_ring_and_are_due_once_a_week_whatever_the_lap(self):
         gone, live = row("http://a.test/gone"), row("http://a.test/live")
@@ -497,6 +522,8 @@ class ScopeTest(unittest.TestCase):
         for url, cells in [("http://panel.example:8080/live/u1/p1/1.ts", {}),
                            ("http://panel.example:8080/u1/p1/1", {"reason": "listed:xtreamiptv.xyz"}),
                            ("https://cdn.example/live.m3u8", {"headers": '{"Referer":"https://s.example/?token=a"}'}),
+                           ("https://cdn.example/live.m3u8", {"headers": '{"Referer":"https://s.example/?token=a"}',
+                                                             "seen_in": "iptv-org", "reason": "iptv-org-url"}),
                            ("https://cdn.example/live.m3u8?token=abc", {}),
                            ("https://cdn.example/live.m3u8", {"reason": "minted"}),
                            ("https://cdn.example/live.m3u8", {"reason": "credential"}),
@@ -616,8 +643,25 @@ class RunTest(ServerTest):
             self.assertEqual(state[fast], Record("suspect", first.date(), "gone", "00000000"))
             cursor = monitor.read_cursor(repo)
 
+            # a gone row is re-probed only in its run of the week, before the ring, and never moves the cursor
+            gone_url = urls[0]
+            state[gone_url] = Record("gone", first.date() - timedelta(days=40), "gone", "00000000")
+            monitor.write_state(repo, state, cursor, monitor.load_rows(monitor.pool_paths(repo)), first.date())
+            key = int(monitor.ring_key(gone_url), 16) % monitor.RUNS_A_WEEK
+            runs = [first + timedelta(hours=12 * n) for n in range(2, 16)]
+            due = next(r for r in runs if monitor.run_slot(r) == key)
+            other = next((r for r in runs if r < due), None)
+            if other is not None:
+                monitor.run(repo, other, time.monotonic() + 10, self.prober, fetch=fetch)
+                self.assertEqual(monitor.read_state(repo)[gone_url].state, "gone")
+            report = monitor.run(repo, due, time.monotonic() + 10, self.prober, fetch=fetch)
+            self.assertEqual((report.gone_due, report.due, report.taken), (1, 2, 2))
+            self.assertEqual(monitor.read_state(repo)[gone_url].state, "alive")
+            self.assertEqual(monitor.read_cursor(repo), max(monitor.ring_key(u) for u in urls[1:]))
+            state, cursor = monitor.read_state(repo), monitor.read_cursor(repo)
+
             # the budget already spent: nothing probed, the sample cut short, nothing changes
-            monitor.run(repo, first + timedelta(hours=24), time.monotonic() - 1, self.prober, fetch=fetch)
+            monitor.run(repo, first + timedelta(days=9), time.monotonic() - 1, self.prober, fetch=fetch)
             self.assertEqual(monitor.read_state(repo), state)
             self.assertEqual(monitor.read_cursor(repo), cursor)
 
