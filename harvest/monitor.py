@@ -83,7 +83,7 @@ HARD = frozenset(("gone", "unlisted"))  # D3's hard last result: 404/410/NXDOMAI
 WINDOWS = (14, 30)  # days failing before gone: with a hard last result, with any (doubled for "Not 24/7")
 STATE_COLUMNS = ["url", "state", "since", "class", "slots"]
 SLOTS = 8  # UTC 3-hour slots (D5)
-RUNS_A_DAY = (1, 2)  # D10: the private repo once a day; D5: the public repo twice, 12 hours apart
+RUNS_A_DAY = (1, 2)  # D10: the private repo once a day (twice on Sundays); D5: the public repo twice, 12 hours apart
 STATE_FILE = Path("monitor") / "state.tsv"
 CURSOR_FILE = Path("monitor") / "cursor"
 KEY_LENGTH = 16
@@ -527,14 +527,15 @@ class Prober:
 
 # --- one run: what to probe, the sweep, the FAST indexes ------------------------------------------------------------
 
-def run_slot(moment: datetime, runs_a_day: int = 2) -> int:
+def run_slot(moment: datetime, runs_a_day: int) -> int:
     """This run's place in the week (0 to 7 x runs_a_day - 1): the UTC day, and with two runs a day whether it is
-    before or after 12:00 (D5, D10)."""
+    before or after 12:00 (D5, D10). A day's extra run (D10's second Sunday run) repeats its slot: those gone rows are
+    probed twice."""
     utc = moment.astimezone(timezone.utc)
     return utc.date().toordinal() % 7 * runs_a_day + utc.hour * runs_a_day // 24
 
 
-def gone_due(rows: Iterable[Row], state: dict[str, Record], now: datetime, runs_a_day: int = 2) -> list[Row]:
+def gone_due(rows: Iterable[Row], state: dict[str, Record], now: datetime, runs_a_day: int) -> list[Row]:
     """The gone rows this run re-probes (D3: weekly): those whose key falls in this run's slot of the week, so each is
     probed once a week whatever the ring's lap length (a missed run leaves its rows to the next week)."""
     slot = run_slot(now, runs_a_day)
@@ -706,7 +707,7 @@ def service_result(classes: list[str]) -> str:
         return "listed"
     failing = [cls for cls in classes if cls in ("down", "gone")]
     if 100 * len(failing) >= OUTAGE_PERCENT * len(classes):
-        return Counter(failing).most_common(1)[0][0]
+        return "gone" if failing.count("gone") > failing.count("down") else "down"  # a tie is not the hard result
     if 100 * classes.count("blocked") >= OUTAGE_PERCENT * len(classes):
         return "blocked"
     return "listed"
@@ -861,7 +862,7 @@ class Report:
     due: int
     taken: int
     sampled: int
-    samples: dict[str, dict[str, int]]  # service -> sample classes by count
+    sample_classes: dict[str, dict[str, int]]  # service -> its sample's classes by count
     indexes: dict[str, str]
     results: Counter
     states: Counter
@@ -892,7 +893,8 @@ def run(repo: Path, now: datetime, stop_at: float, prober: Prober, workers: int 
     new_state = advance(state, results, rows, now)
     write_state(repo, new_state, due[taken - 1].key if taken else cursor, rows, now.astimezone(timezone.utc).date())
     return Report(rows=len(rows), fast=len(fast_rows), gone_due=len(gone), due=len(due), taken=taken,
-                  sampled=len(samples), samples=sample_counts(samples, done.results), indexes={s: ("used" if s in indexes else "not used") for s in FAST_SERVICES},
+                  sampled=len(samples), sample_classes=sample_counts(samples, done.results),
+                  indexes={s: ("used" if s in indexes else "not used") for s in FAST_SERVICES},
                   results=Counter(results.values()), states=Counter(r.state for r in new_state.values()),
                   changed=sum(1 for url, r in new_state.items() if state.get(url) != r), errors=done.errors,
                   lookups=Counter(prober.resolver.outcomes), seconds=round(time.monotonic() - started, 1))
@@ -916,7 +918,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(f"in scope {report.rows} (FAST {report.fast}); gone due {report.gone_due}; ring due {report.due}, taken "
           f"{report.taken}; FAST sample {report.sampled}; indexes {report.indexes}; {report.seconds} s")
-    print(f"FAST samples {report.samples}")
+    print(f"FAST sample classes {report.sample_classes}")
     print(f"results {dict(report.results)}; states {dict(report.states)}; rows changed {report.changed}"
           + (f"; probe errors {dict(report.errors)}" if report.errors else ""))
     usage = resource.getrusage(resource.RUSAGE_SELF)  # the runner's fit (Spec 71 D6): CPU against wall time
