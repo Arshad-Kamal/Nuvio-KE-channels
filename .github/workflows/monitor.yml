@@ -44,7 +44,7 @@ jobs:
         env:
           BUDGET: ${{ inputs.budget || 900 }}  # a whole lap took 324 s (Spec 71 M1.3); FAST samples can hang ~500 s
           LOOKUPS: ${{ inputs.lookups || 8 }}
-        run: python3 harvest/monitor.py . --budget="$BUDGET" --lookups="$LOOKUPS"
+        run: python3 harvest/monitor.py . --budget="$BUDGET" --lookups="$LOOKUPS" --runs-a-day=2
       - name: Commit
         if: github.event_name != 'workflow_dispatch' || inputs.commit
         env:

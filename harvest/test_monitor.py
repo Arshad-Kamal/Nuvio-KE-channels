@@ -434,25 +434,23 @@ class RingTest(unittest.TestCase):
         slots = [monitor.run_slot(morning + timedelta(hours=12 * n), 2) for n in range(14)]
         self.assertEqual(sorted(slots), list(range(14)))
 
-    @staticmethod
-    def private_runs(weeks: int) -> list[datetime]:
-        """D10's schedule: Monday 00:17 UTC, 3 hours later each day, Sunday 18:17 and 21:17."""
+    # D10's private cron, (weekday, UTC hour), Monday = 0: the private workflow's schedule lines
+    PRIVATE_CRON = [(0, 0), (1, 3), (2, 6), (3, 9), (4, 12), (5, 15), (6, 18), (6, 21)]
+
+    def private_runs(self, weeks: int) -> list[datetime]:
         monday = datetime(2026, 11, 2, 0, 17, tzinfo=timezone.utc)
-        return [monday + timedelta(days=7 * week + slot - (slot == 7), hours=3 * slot)
-                for week in range(weeks) for slot in range(8)]
+        return [monday + timedelta(days=7 * week + day, hours=hour)
+                for week in range(weeks) for day, hour in self.PRIVATE_CRON]
 
     def test_run_slot_counts_one_run_a_day_at_any_hour(self):
         runs = self.private_runs(1)
-        self.assertEqual([run.hour for run in runs], [0, 3, 6, 9, 12, 15, 18, 21])
+        self.assertEqual([(run.weekday(), run.hour) for run in runs], self.PRIVATE_CRON)
         self.assertEqual(sorted({monitor.run_slot(run, 1) for run in runs}), list(range(7)))
 
     def test_every_gone_row_is_due_once_a_week_with_one_run_a_day(self):
         gone = [row(f"http://a.test/gone/{i}") for i in range(40)]
         state = {r.url: Record("gone", date(2026, 1, 1), "gone", "0" * 8) for r in gone}
-        days = Counter(run.date() for run in self.private_runs(2))
-        due = Counter(r.url for day, runs in days.items() for r in
-                      monitor.gone_due(gone, state, datetime(day.year, day.month, day.day, tzinfo=timezone.utc), 1)
-                      for _ in range(runs))
+        due = Counter(r.url for run in self.private_runs(2) for r in monitor.gone_due(gone, state, run, 1))
         on_sunday = {r.url for r in gone if int(r.key, 16) % 7 == date(2026, 11, 8).toordinal() % 7}
         self.assertEqual(due, Counter({r.url: 4 if r.url in on_sunday else 2 for r in gone}))  # weekly; Sunday twice
 
@@ -647,7 +645,7 @@ class FilesTest(unittest.TestCase):
         with self.assertRaises(MonitorError):
             monitor.pool_paths(public)
         with redirect_stderr(StringIO()) as err:
-            self.assertEqual(monitor.main([str(public), "--budget", "1"]), 1)
+            self.assertEqual(monitor.main([str(public), "--budget", "1", "--runs-a-day", "2"]), 1)
         self.assertIn("nothing written", err.getvalue())
         self.assertFalse((public / "monitor").exists())
 
@@ -701,7 +699,7 @@ class RunTest(ServerTest):
                 raise lists.FetchError("down")
 
             first = datetime(2026, 11, 8, 3, 17, tzinfo=timezone.utc)
-            report = monitor.run(repo, first, time.monotonic() + 10, self.prober, fetch=fetch)
+            report = monitor.run(repo, first, time.monotonic() + 10, self.prober, fetch=fetch, runs_a_day=2)
             state = monitor.read_state(repo)
             self.assertEqual({u: (r.state, r.cls) for u, r in state.items()},
                              {urls[0]: ("alive", "ok"), urls[1]: ("suspect", "gone"), urls[2]: ("blocked", "blocked"),
@@ -713,7 +711,7 @@ class RunTest(ServerTest):
             self.assertEqual(monitor.read_cursor(repo), max(monitor.ring_key(u) for u in urls))
 
             report = monitor.run(repo, first + timedelta(hours=12), time.monotonic() + 10, self.prober,
-                                 fetch=lambda url: fetch(url, {"regions": {"ca": {"channels": {}}}}))
+                                 fetch=lambda url: fetch(url, {"regions": {"ca": {"channels": {}}}}), runs_a_day=2)
             state = monitor.read_state(repo)
             self.assertEqual(state[urls[1]].state, "down")
             # an index listing none of the pool's ids is not used: the FAST row keeps its record
@@ -728,23 +726,24 @@ class RunTest(ServerTest):
             runs = [first + timedelta(hours=12 * n) for n in range(2, 30)]
             due = [r for r in runs if monitor.run_slot(r, 2) == key][1]  # the second week's: other runs precede it
             other = next(r for r in runs if monitor.run_slot(r, 2) != key)
-            monitor.run(repo, other, time.monotonic() + 10, self.prober, fetch=fetch)
+            monitor.run(repo, other, time.monotonic() + 10, self.prober, fetch=fetch, runs_a_day=2)
             self.assertEqual(monitor.read_state(repo)[gone_url].state, "gone")
-            report = monitor.run(repo, due, time.monotonic() + 10, self.prober, fetch=fetch)
+            report = monitor.run(repo, due, time.monotonic() + 10, self.prober, fetch=fetch, runs_a_day=2)
             self.assertEqual((report.gone_due, report.due, report.taken), (1, 2, 2))
             self.assertEqual(monitor.read_state(repo)[gone_url].state, "alive")
             self.assertEqual(monitor.read_cursor(repo), max(monitor.ring_key(u) for u in urls[1:]))
             state, cursor = monitor.read_state(repo), monitor.read_cursor(repo)
 
             # the budget already spent: nothing probed, the sample cut short, nothing changes
-            monitor.run(repo, due + timedelta(hours=12), time.monotonic() - 1, self.prober, fetch=fetch)
+            monitor.run(repo, due + timedelta(hours=12), time.monotonic() - 1, self.prober, fetch=fetch,
+                        runs_a_day=2)
             self.assertEqual(monitor.read_state(repo), state)
             self.assertEqual(monitor.read_cursor(repo), cursor)
 
             # the private repo's one run a day picks its gone rows by the day alone
             with mock.patch.object(monitor, "gone_due", wraps=monitor.gone_due) as picked:
                 monitor.run(repo, due, time.monotonic() - 1, self.prober, fetch=fetch, runs_a_day=1)
-            self.assertEqual(picked.call_args.args[3], 1)
+            self.assertEqual(picked.call_args.kwargs, {"runs_a_day": 1})
 
 
 class MainTest(unittest.TestCase):
@@ -756,9 +755,13 @@ class MainTest(unittest.TestCase):
                                 seconds=1.0)
         with tempfile.TemporaryDirectory() as name, mock.patch.object(monitor, "run", return_value=report), \
                 redirect_stdout(StringIO()) as out:
-            self.assertEqual(monitor.main([name, "--budget", "1"]), 0)
+            self.assertEqual(monitor.main([name, "--budget", "1", "--runs-a-day", "2"]), 0)
         self.assertRegex(out.getvalue(), r"\nlookups \{'ok': 2\}; CPU \d+\.\d s; max RSS \d+ MB\n$")
         self.assertIn("\nFAST sample classes {'plex': {'gone': 12, 'ok': 8}}\n", out.getvalue())
+
+    def test_runs_a_day_is_required(self):  # no default: the cadence is the workflow's, never assumed
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            monitor.main(["repo", "--budget", "1"])
 
     def test_lookups_reach_the_resolver_and_the_run(self):
         report = monitor.Report(rows=0, fast=0, gone_due=0, due=0, taken=0, sampled=0, sample_classes={}, indexes={},

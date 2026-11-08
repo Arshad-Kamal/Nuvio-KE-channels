@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Probes a channel repo's pool and keeps per-URL state (Nuvio-Project Spec 71 M1.2).
 
-Usage: monitor.py <repo> --budget SECONDS [--workers N] [--lookups N] [--runs-a-day 1|2]
+Usage: monitor.py <repo> --budget SECONDS --runs-a-day 1|2 [--workers N] [--lookups N]
 
 <repo> is the public checkout (it holds harvest/; pool: pool/streams.tsv) or the private repo (pool/private.tsv and
 pool/nsfw.tsv); the kind is read from the repo, so no argument can mix the two. The monitor never changes membership:
@@ -873,7 +873,7 @@ class Report:
 
 
 def run(repo: Path, now: datetime, stop_at: float, prober: Prober, workers: int = WORKERS,
-        lookups: int = DNS_LOOKUPS, fetch: Callable[[str], lists.Fetched] = lists.fetch, runs_a_day: int = 2) -> Report:
+        lookups: int = DNS_LOOKUPS, fetch: Callable[[str], lists.Fetched] = lists.fetch, *, runs_a_day: int) -> Report:
     """One monitor run over the repo (module docstring); raises MonitorError before writing anything it refuses."""
     started = time.monotonic()
     rows = load_rows(pool_paths(repo))
@@ -882,7 +882,7 @@ def run(repo: Path, now: datetime, stop_at: float, prober: Prober, workers: int 
     others = [row for row in rows.values() if not row.service]
     indexes = usable_indexes(fetch_indexes(fetch), fast_rows)
     samples = pick_samples(fast_rows, indexes, random.Random(now.isoformat()))
-    gone = gone_due(others, state, now, runs_a_day)
+    gone = gone_due(others, state, now, runs_a_day=runs_a_day)
     head = samples + gone  # probed first, outside the ring and its cursor
     due = ring(others, cursor, state)
     done = sweep(head + due, prober, stop_at, workers, deadline=prober.deadline, resolve=prober.resolver.warm,
@@ -907,7 +907,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--budget", type=float, required=True, help="seconds from start after which no probe starts")
     parser.add_argument("--workers", type=int, default=WORKERS)
     parser.add_argument("--lookups", type=int, default=DNS_LOOKUPS, help="DNS lookups at once")
-    parser.add_argument("--runs-a-day", type=int, choices=RUNS_A_DAY, default=2,
+    parser.add_argument("--runs-a-day", type=int, choices=RUNS_A_DAY, required=True,
                         help="scheduled runs a day (gone rows are re-probed weekly by run slot)")
     args = parser.parse_args(argv)
     try:
