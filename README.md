@@ -31,6 +31,16 @@ string (`?...`), `;` parameters or a Kodi `|` suffix is published only when iptv
 
 The checked list the app downloads comes later.
 
+## License
+
+- Code (`harvest/`, `.github/`): [MIT](LICENSE).
+- Lists (`pool/`, `monitor/`, `harvest/reviewed-hosts.txt`): [CC0 1.0](LICENSE-DATA). This covers only what this
+  repo adds (the grouping, headers, review notes and check results). The streams, channel names and logos belong to
+  their owners, and rows taken from [iptv-org](https://github.com/iptv-org/iptv) follow iptv-org's own terms.
+- `pool/` and `monitor/` are working files, not a stable interface: columns, names and locations may change without
+  notice. If you build on them, pin a commit. The monitor checks streams from GitHub's servers, so a stream limited to
+  one country can show as `blocked` or `down` here and still play there. No warranty and no support promise.
+
 ## Takedown requests
 
 If you own a channel listed here and want it removed, open an issue with the channel name; it will be removed
